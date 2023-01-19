@@ -1,0 +1,28 @@
+---
+BasedOnStyle: LLVM
+ColumnLimit: 100
+ContinuationIndentWidth: 8
+IndentWidth: 8
+TabWidth: 8
+UseTab: Always
+---
+Language: Cpp
+AlignAfterOpenBracket: AlwaysBreak
+AlignEscapedNewlines: DontAlign
+AlignOperands: DontAlign
+AlignTrailingComments: true
+AllowShortEnumsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: Never
+AlwaysBreakAfterReturnType: AllDefinitions
+AlwaysBreakBeforeMultilineStrings: true
+BreakBeforeBraces: Linux
+BreakBeforeTernaryOperators: false
+ForEachMacros:
+  - STAILQ_FOREACH
+  - TAILQ_FOREACH
+IndentGotoLabels: false
+IndentPPDirectives: BeforeHash
+InsertBraces: true
+SortIncludes: false
+...
