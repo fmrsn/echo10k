@@ -1,11 +1,19 @@
-typedef struct Task_Context_ Task_Context;
-typedef struct Task_Queue_ Task_Queue;
+typedef struct Task_Queue Task_Queue;
+typedef struct Task_Context Task_Context;
 
-static void Task_InitQueue(Task_Queue *queue, int workerCount);
+static void Task_Init(Task_Queue *queue, int workerCount);
 static void
 Task_Enqueue(Task_Queue *queue, Task_Context *ctx, void (*proc)(void *, Task_Context *), void *arg);
 static void Task_WaitAll(Task_Queue *queue);
-static void Task_DeinitQueue(Task_Queue *queue);
+static void Task_Deinit(Task_Queue *queue);
+
+#if 0
+typedef struct Event_Loop Event_Loop;
+typedef struct Event_Completion Event_Completion;
+
+static void Event_InitLoop(Event_Loop *loop);
+static void Event_DeinitLoop(Event_Loop *loop);
+#endif
 
 /* *************************************** */
 
@@ -17,33 +25,34 @@ static void Task_DeinitQueue(Task_Queue *queue);
 #include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <unistd.h>
 
-typedef struct TaskWorker_ {
-	TAILQ_ENTRY(TaskWorker_) link;
+typedef struct TaskWorker {
+	TAILQ_ENTRY(TaskWorker) link;
 	Task_Queue *const queue;
-	const pthread_t t;
+	const pthread_t thread;
 } TaskWorker;
 
-typedef TAILQ_HEAD(TaskWorkerList_, TaskWorker_) TaskWorkerList;
+typedef TAILQ_HEAD(TaskWorkerList, TaskWorker) TaskWorkerList;
 
-struct Task_Context_ {
-	STAILQ_ENTRY(Task_Context_) link;
+struct Task_Context {
+	STAILQ_ENTRY(Task_Context) link;
 	void (*func)(void *, Task_Context *);
 	void *arg;
 };
 
-typedef STAILQ_HEAD(TaskContextQueue_, Task_Context_) TaskContextQueue;
+typedef STAILQ_HEAD(TaskContextQueue, Task_Context) TaskContextQueue;
 
-struct Task_Queue_ {
-	sigset_t signalSet;
+struct Task_Queue {
+	sigset_t allSignals;
 	pthread_attr_t workerAttr;
-	pthread_cond_t wakeUp;
-	pthread_cond_t allDone;
-	pthread_cond_t stopped;
+	pthread_cond_t workToDo;
+	pthread_cond_t workDone;
+	pthread_cond_t queueStopped;
 	pthread_mutex_t mutex;
 	TaskContextQueue pendingTasks;
 	TaskWorkerList activeWorkers;
-	int workerCount;
+	int spawnedCount;
 	int idleCount;
 	bool waiting : 1;
 	bool deiniting : 1;
@@ -56,21 +65,21 @@ static void *
 TaskWork(void *arg)
 {
 	Task_Queue *queue = arg;
-	TaskWorker worker = {.queue = queue, .t = pthread_self()};
+	TaskWorker worker = {.queue = queue, .thread = pthread_self()};
 
 	(void)pthread_mutex_lock(&queue->mutex);
-	++queue->workerCount;
+	++queue->spawnedCount;
 
 	pthread_cleanup_push(TaskCleanUp, queue);
 	for (;;) {
 		/* Reset thread signals and cancellation state. */
-		(void)pthread_sigmask(SIG_SETMASK, &queue->signalSet, NULL);
+		(void)pthread_sigmask(SIG_SETMASK, &queue->allSignals, NULL);
 		(void)pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
 		(void)pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
 
 		++queue->idleCount;
 		while (!queue->deiniting && STAILQ_EMPTY(&queue->pendingTasks)) {
-			(void)pthread_cond_wait(&queue->wakeUp, &queue->mutex);
+			(void)pthread_cond_wait(&queue->workToDo, &queue->mutex);
 		}
 		--queue->idleCount;
 		if (queue->deiniting) {
@@ -107,7 +116,7 @@ TaskDone(void *arg)
 		return;
 	}
 	if (queue->waiting) {
-		(void)pthread_cond_broadcast(&queue->allDone);
+		(void)pthread_cond_broadcast(&queue->workDone);
 		queue->waiting = 0;
 	}
 }
@@ -119,14 +128,14 @@ TaskCleanUp(void *arg)
 	pthread_t t;
 	int r;
 
-	--queue->workerCount;
+	--queue->spawnedCount;
 
 	if (!queue->deiniting) {
 		r = pthread_create(&t, &queue->workerAttr, TaskWork, queue);
 		assert(r == 0);
 
-	} else if (queue->workerCount == 0) {
-		(void)pthread_cond_broadcast(&queue->stopped);
+	} else if (queue->spawnedCount == 0) {
+		(void)pthread_cond_broadcast(&queue->queueStopped);
 	}
 
 	pthread_mutex_unlock(&queue->mutex);
@@ -135,36 +144,35 @@ TaskCleanUp(void *arg)
 /*
  * TODO(fmrsn):
  *
- * - param: min/max workers available
- * - param: how much time a thread should stay idle before exiting
  * - wait for individual tasks
  * - fork() safety
  */
 
 static void
-Task_InitQueue(Task_Queue *queue, int workerCount)
+Task_Init(Task_Queue *queue, int numWorkers)
 {
-	assert(workerCount > 0);
+	assert(numWorkers > 0);
 
-	(void)sigfillset(&queue->signalSet);
+	(void)sigfillset(&queue->allSignals);
 
 	(void)pthread_attr_init(&queue->workerAttr);
 	(void)pthread_attr_setdetachstate(&queue->workerAttr, PTHREAD_CREATE_DETACHED);
 
 	(void)pthread_mutex_init(&queue->mutex, NULL);
-	(void)pthread_cond_init(&queue->wakeUp, NULL);
-	(void)pthread_cond_init(&queue->allDone, NULL);
-	(void)pthread_cond_init(&queue->stopped, NULL);
+	(void)pthread_cond_init(&queue->workToDo, NULL);
+	(void)pthread_cond_init(&queue->workDone, NULL);
+	(void)pthread_cond_init(&queue->queueStopped, NULL);
 
 	STAILQ_INIT(&queue->pendingTasks);
 	TAILQ_INIT(&queue->activeWorkers);
 
 	queue->idleCount = 0;
-	queue->workerCount = 0;
+	queue->spawnedCount = 0;
 
-	for (int i = 0; i < workerCount; ++i) {
-		pthread_t t;
-		int ret = pthread_create(&t, &queue->workerAttr, TaskWork, queue);
+	pthread_t thread;
+	int ret;
+	for (int i = 0; i < numWorkers; ++i) {
+		ret = pthread_create(&thread, &queue->workerAttr, TaskWork, queue);
 		assert(ret == 0);
 	}
 }
@@ -178,14 +186,14 @@ Task_Enqueue(Task_Queue *queue, Task_Context *ctx, void (*func)(void *, Task_Con
 
 	STAILQ_INSERT_TAIL(&queue->pendingTasks, ctx, link);
 	if (queue->idleCount > 0) {
-		pthread_cond_signal(&queue->wakeUp);
+		pthread_cond_signal(&queue->workToDo);
 	}
 
 	(void)pthread_mutex_unlock(&queue->mutex);
 }
 
 static void
-PthreadMutexUnlock(void *mutex)
+TaskUnlockMutex(void *mutex)
 {
 	(void)pthread_mutex_unlock(mutex);
 }
@@ -194,36 +202,36 @@ static void
 Task_WaitAll(Task_Queue *queue)
 {
 	(void)pthread_mutex_lock(&queue->mutex);
-	pthread_cleanup_push(PthreadMutexUnlock, &queue->mutex);
+	pthread_cleanup_push(TaskUnlockMutex, &queue->mutex);
 
 	while (!STAILQ_EMPTY(&queue->pendingTasks) || !TAILQ_EMPTY(&queue->activeWorkers)) {
 		queue->waiting = 1;
-		(void)pthread_cond_wait(&queue->allDone, &queue->mutex);
+		(void)pthread_cond_wait(&queue->workDone, &queue->mutex);
 	}
 
 	pthread_cleanup_pop(1);
 }
 
 static void
-Task_DeinitQueue(Task_Queue *queue)
+Task_Deinit(Task_Queue *queue)
 {
 	(void)pthread_mutex_lock(&queue->mutex);
-	pthread_cleanup_push(PthreadMutexUnlock, &queue->mutex);
+	pthread_cleanup_push(TaskUnlockMutex, &queue->mutex);
 
 	queue->deiniting = 1;
-	(void)pthread_cond_broadcast(&queue->wakeUp);
+	(void)pthread_cond_broadcast(&queue->workToDo);
 
 	TaskWorker *active;
 	TAILQ_FOREACH (active, &queue->activeWorkers, link) {
-		(void)pthread_cancel(active->t);
+		(void)pthread_cancel(active->thread);
 	}
 	while (!TAILQ_EMPTY(&queue->activeWorkers)) {
 		queue->waiting = 1;
-		(void)pthread_cond_wait(&queue->allDone, &queue->mutex);
+		(void)pthread_cond_wait(&queue->workDone, &queue->mutex);
 	}
 
-	while (queue->workerCount > 0) {
-		(void)pthread_cond_wait(&queue->stopped, &queue->mutex);
+	while (queue->spawnedCount > 0) {
+		(void)pthread_cond_wait(&queue->queueStopped, &queue->mutex);
 	}
 
 	pthread_cleanup_pop(1);
@@ -233,33 +241,36 @@ Task_DeinitQueue(Task_Queue *queue)
 	}
 
 	pthread_attr_destroy(&queue->workerAttr);
-	pthread_cond_destroy(&queue->wakeUp);
-	pthread_cond_destroy(&queue->allDone);
-	pthread_cond_destroy(&queue->stopped);
+	pthread_cond_destroy(&queue->workToDo);
+	pthread_cond_destroy(&queue->workDone);
+	pthread_cond_destroy(&queue->queueStopped);
 	pthread_mutex_destroy(&queue->mutex);
 }
 
 /***********************************************************************/
 
+#include <stdint.h>
 #include <stdio.h>
+#include <unistd.h>
 
 void
 Hello(void *arg, Task_Context *ctx)
 {
-	(void)arg;
 	(void)ctx;
-
-	puts("Hello, world!");
+	printf("Hello from worker %d\n", (int)(intptr_t)arg);
 }
 
 int
 main(void)
 {
 	Task_Queue q;
-	Task_Context ctx;
 
-	Task_InitQueue(&q, 1);
-	Task_Enqueue(&q, &ctx, Hello, NULL);
+	Task_Context contexts[5];
+
+	Task_Init(&q, 4);
+	for (int i = 0; i < (int)(sizeof contexts / sizeof contexts[0]); ++i) {
+		Task_Enqueue(&q, &contexts[i], Hello, (void *)(intptr_t)i);
+	}
 	Task_WaitAll(&q);
-	Task_DeinitQueue(&q);
+	Task_Deinit(&q);
 }
