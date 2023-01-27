@@ -1,10 +1,23 @@
 #define _POSIX_C_SOURCE 200908L // TODO(fmrsn): Move to command line
 
-#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
-#define SizeOf(x) (int)sizeof(x)
+typedef int32_t Int;
+typedef int64_t Long;
+
+typedef uint32_t UInt;
+typedef uint64_t ULong;
+
+typedef ptrdiff_t Size;
+typedef size_t USize;
+
+typedef intptr_t Ptr;
+typedef uintptr_t UPtr;
+
+typedef Int Bool;
+
+#define SizeOf(x) (Size)sizeof(x)
 #define CountOf(x) (SizeOf(x) / SizeOf((x)[0]))
 
 // TODO(fmrsn): Remove stdlib dependency
@@ -15,30 +28,30 @@ typedef struct TaskQueue TaskQueue;
 typedef void TaskFunc(void *arg);
 
 // TODO(fmrsn): use memory arena + pool allocator for context objects
-static void TaskInitQueue(TaskQueue *queue, int numWorkers);
+static void TaskInitQueue(TaskQueue *queue, Int numWorkers);
 static void TaskDeinitQueue(TaskQueue *queue);
 static void TaskExecute(TaskQueue *queue, TaskFunc *func, void *funcArg);
 static void TaskWaitAll(TaskQueue *queue);
 
 typedef struct EventLoop EventLoop;
-typedef void EventCallback(void *arg, intptr_t ret);
+typedef void EventCallback(void *arg, Ptr ret);
 
 // TODO(fmrsn): use memory arena + pool allocator for context objects
 static void EventInitLoop(EventLoop *loop);
 static void EventAccept(EventLoop *loop, int sock, EventCallback *callback, void *callbackArg);
 static void EventClose(EventLoop *loop, int fd, EventCallback *callback, void *callbackArg);
 static void EventRecv(
-	EventLoop *loop, int sock, void *buffer, int bufferSize, EventCallback *callback,
+	EventLoop *loop, int sock, void *buffer, Size bufferSize, EventCallback *callback,
 	void *callbackArg);
 static void EventSend(
-	EventLoop *loop, int sock, const void *buffer, int bufferSize, EventCallback *callback,
+	EventLoop *loop, int sock, const void *buffer, Size bufferSize, EventCallback *callback,
 	void *callbackArg);
-static void EventTimer(EventLoop *loop, int64_t ns, EventCallback *callback, void *callbackArg);
+static void EventTimer(EventLoop *loop, Long ns, EventCallback *callback, void *callbackArg);
 static void EventTick(EventLoop *loop);
-static void EventLoopFor(EventLoop *loop, int64_t ns);
+static void EventLoopForNs(EventLoop *loop, Long ns);
 static void EventDeinitLoop(EventLoop *loop);
 
-// TODO(fmrsn): operation: cancel submission
+// TODO(fmrsn): operation: cancel event submission
 
 /* *************************************** */
 
@@ -75,17 +88,18 @@ struct TaskQueue {
 	pthread_mutex_t mutex;
 	taskSubmissionList pending;
 	taskSubmissionList active;
-	int spawned;
-	int idle;
-	bool waiting;
-	bool deiniting;
+	Int spawned;
+	Int idle;
+	Bool waiting;
+	Bool deiniting;
 };
 
-// TODO: use memory arenas
+// TODO(fmrsn): (De)allocations using malloc/free here are pretty frequent.
+//  It can (and will) cause a bottleneck. Use memory arenas instead.
 static taskSubmission *
 taskAlloc(void)
 {
-	taskSubmission *s = malloc(sizeof(*s));
+	taskSubmission *s = malloc(SizeOf(*s));
 	Assert(s);
 	return s;
 }
@@ -199,7 +213,7 @@ taskUnlockMutex(void *mutex)
  */
 
 static void
-TaskInitQueue(TaskQueue *queue, int numWorkers)
+TaskInitQueue(TaskQueue *queue, Int numWorkers)
 {
 	Assert(numWorkers > 0);
 
@@ -221,7 +235,7 @@ TaskInitQueue(TaskQueue *queue, int numWorkers)
 
 	pthread_t tid;
 	int ret;
-	for (int i = 0; i < numWorkers; ++i) {
+	for (Int i = 0; i < numWorkers; ++i) {
 		ret = pthread_create(&tid, &queue->workerAttr, taskWork, queue);
 		Assert(ret == 0);
 	}
@@ -313,17 +327,17 @@ typedef struct {
 		struct {
 			int sock;
 			void *buffer;
-			int size;
+			Size bufferSize;
 		} recv;
 
 		struct {
 			int sock;
 			const void *buffer;
-			int size;
+			Size bufferSize;
 		} send;
 
 		struct {
-			int64_t ns;
+			Long ns;
 		} timer;
 	} args;
 } eventOp;
@@ -331,10 +345,10 @@ typedef struct {
 typedef struct eventSubmission {
 	TAILQ_ENTRY(eventSubmission) link;
 	eventOp op;
-	intptr_t (*onReady)(const eventOp *op);
-	void (*callback)(void *arg, intptr_t ret);
+	Ptr (*onReady)(const eventOp *op);
+	void (*callback)(void *arg, Ptr ret);
 	void *callbackArg;
-	intptr_t ret;
+	Ptr ret;
 } eventSubmission;
 
 typedef TAILQ_HEAD(eventSubmissionQueue, eventSubmission) eventSubmissionQueue;
@@ -349,7 +363,7 @@ struct EventLoop {
 static eventSubmission *
 eventAlloc(void)
 {
-	eventSubmission *s = malloc(sizeof(*s));
+	eventSubmission *s = malloc(SizeOf(*s));
 	Assert(s);
 	return s;
 }
@@ -404,7 +418,7 @@ eventFlushPending(
 			break;
 
 		case eventOpTimer:
-			event->ident = (uintptr_t)s;
+			event->ident = (UPtr)s;
 			event->filter = EVFILT_TIMER;
 			event->fflags = NOTE_NSECONDS;
 			event->data = op->args.timer.ns;
@@ -460,7 +474,7 @@ eventFlushAndWait(EventLoop *loop, const struct timespec *timeout)
 
 		EventCallback *callback = s->callback;
 		void *arg = s->callbackArg;
-		intptr_t ret = s->ret;
+		Ptr ret = s->ret;
 		eventFree(s);
 
 		if (callback) {
@@ -490,26 +504,24 @@ EventTick(EventLoop *loop)
 	eventFlushAndWait(loop, &(struct timespec){0});
 }
 
-static void eventLoopDone(void *, intptr_t);
+static void
+eventLoopDone(void *arg, Ptr ret)
+{
+	(void)ret;
+
+	Bool *done = arg;
+	*done = 1;
+}
 
 static void
-EventLoopFor(EventLoop *loop, int64_t ns)
+EventLoopForNs(EventLoop *loop, Long ns)
 {
-	bool done = 0;
+	Bool done = 0;
 
 	EventTimer(loop, ns, eventLoopDone, &done);
 	while (!done) {
 		eventFlushAndWait(loop, NULL);
 	}
-}
-
-static void
-eventLoopDone(void *arg, intptr_t ret)
-{
-	(void)ret;
-
-	bool *done = arg;
-	*done = 1;
 }
 
 static void
@@ -520,7 +532,7 @@ eventSubmit(eventSubmissionQueue *queue, eventSubmission *submission)
 	TAILQ_INSERT_TAIL(queue, s, link);
 }
 
-static intptr_t
+static Ptr
 eventAcceptOnReady(const eventOp *op)
 {
 	Assert(op->code == eventOpAccept);
@@ -553,7 +565,7 @@ EventAccept(EventLoop *loop, int sock, EventCallback *callback, void *arg)
 		});
 }
 
-static intptr_t
+static Ptr
 eventCloseOnReady(const eventOp *op)
 {
 	Assert(op->code == eventOpClose);
@@ -578,22 +590,22 @@ EventClose(EventLoop *loop, int fd, EventCallback *callback, void *callbackArg)
 		});
 }
 
-static intptr_t
+static Ptr
 eventRecvOnReady(const eventOp *op)
 {
 	Assert(op->code == eventOpRecv);
 
 	int sock = op->args.recv.sock;
 	void *buffer = op->args.recv.buffer;
-	size_t size = op->args.recv.size;
+	Size bufferSize = op->args.recv.bufferSize;
 
-	ssize_t n = recv(sock, buffer, size, 0);
+	ssize_t n = recv(sock, buffer, bufferSize, 0);
 	return n < 0 ? -errno : n;
 }
 
 static void
 EventRecv(
-	EventLoop *loop, int sock, void *buffer, int bufferSize, EventCallback *callback,
+	EventLoop *loop, int sock, void *buffer, Size bufferSize, EventCallback *callback,
 	void *callbackArg)
 {
 	Assert(bufferSize >= 0);
@@ -603,29 +615,29 @@ EventRecv(
 			.op.code = eventOpRecv,
 			.op.args.recv.sock = sock,
 			.op.args.recv.buffer = buffer,
-			.op.args.recv.size = bufferSize,
+			.op.args.recv.bufferSize = bufferSize,
 			.onReady = eventRecvOnReady,
 			.callback = callback,
 			.callbackArg = callbackArg,
 		});
 }
 
-static intptr_t
+static Ptr
 eventSendOnReady(const eventOp *op)
 {
 	Assert(op->code == eventOpSend);
 
 	int sock = op->args.recv.sock;
 	const void *buffer = op->args.recv.buffer;
-	int size = op->args.recv.size;
+	Size bufferSize = op->args.recv.bufferSize;
 
-	ssize_t n = send(sock, buffer, (size_t)size, 0);
+	ssize_t n = send(sock, buffer, bufferSize, 0);
 	return n < 0 ? -errno : n;
 }
 
 static void
 EventSend(
-	EventLoop *loop, int sock, const void *buffer, int bufferSize, EventCallback *callback,
+	EventLoop *loop, int sock, const void *buffer, Size bufferSize, EventCallback *callback,
 	void *callbackArg)
 {
 	Assert(bufferSize >= 0);
@@ -635,7 +647,7 @@ EventSend(
 			.op.code = eventOpSend,
 			.op.args.send.sock = sock,
 			.op.args.send.buffer = buffer,
-			.op.args.send.size = bufferSize,
+			.op.args.send.bufferSize = bufferSize,
 			.onReady = eventSendOnReady,
 			.callback = callback,
 			.callbackArg = callbackArg,
@@ -643,7 +655,7 @@ EventSend(
 }
 
 static void
-EventTimer(EventLoop *loop, int64_t ns, EventCallback *callback, void *callbackArg)
+EventTimer(EventLoop *loop, Long ns, EventCallback *callback, void *callbackArg)
 {
 	Assert(ns >= 0);
 	eventSubmit(
@@ -666,34 +678,34 @@ EventDeinitLoop(EventLoop *loop)
 
 #include <stdio.h>
 
-static TaskQueue taskqueue;
-static EventLoop eventloop;
+static TaskQueue taskQueue;
+static EventLoop eventLoop;
 
 void
 Hello(void *arg)
 {
-	printf("Hello from worker %d\n", (int)(intptr_t)arg);
+	printf("Hello from worker %d\n", (int)(Ptr)arg);
 }
 
 int
 main(void)
 {
 	(void)EventTick;
-	(void)EventLoopFor;
+	(void)EventLoopForNs;
 	(void)EventAccept;
 	(void)EventClose;
 	(void)EventRecv;
 	(void)EventSend;
 
-	TaskInitQueue(&taskqueue, 4);
-	EventInitLoop(&eventloop);
+	TaskInitQueue(&taskQueue, 4);
+	EventInitLoop(&eventLoop);
 
 	for (int i = 0; i < 5; ++i) {
-		TaskExecute(&taskqueue, Hello, (void *)(intptr_t)i);
+		TaskExecute(&taskQueue, Hello, (void *)(Ptr)i);
 	}
 
-	TaskWaitAll(&taskqueue);
+	TaskWaitAll(&taskQueue);
 
-	EventDeinitLoop(&eventloop);
-	TaskDeinitQueue(&taskqueue);
+	EventDeinitLoop(&eventLoop);
+	TaskDeinitQueue(&taskQueue);
 }
