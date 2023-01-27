@@ -689,7 +689,7 @@ main(void)
 	EventInitLoop(&eventloop);
 
 	for (int i = 0; i < 5; ++i) {
-		TaskExecute(&taskqueue, Hello, (void *)(Ptr)i);
+		TaskExecute(&taskqueue, Hello, (void *)(intptr_t)i);
 	}
 
 	TaskWaitAll(&taskqueue);
