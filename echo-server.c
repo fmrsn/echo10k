@@ -3,47 +3,49 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#undef bool
+typedef int32_t Int32;
+typedef int64_t Int64;
 
-typedef int32_t i32;
-typedef int64_t i64;
+typedef float Float;
 
-typedef i32 bool;
+typedef Int32 Bool;
 
-// TODO(fmrsn): change codebase to use isize
-typedef ptrdiff_t isize;
-typedef size_t usize;
+// TODO(fmrsn): change codebase to use Size
+typedef ptrdiff_t Size;
+typedef size_t USize;
 
-typedef intptr_t iptr;
-typedef uintptr_t uptr;
+typedef intptr_t Ptr;
+typedef uintptr_t UPtr;
 
-#define SIZEOF(x) (isize)(sizeof(x))
-#define COUNTOF(x) (SIZEOF(x) / SIZEOF((x)[0]))
+#define SizeOf(x) (Size)(sizeof(x))
+#define CountOf(x) (Size)(sizeof(x) / sizeof((x)[0]))
 
-typedef struct task_queue task_queue;
-typedef void task_callback(void *arg);
-
-// TODO(fmrsn): use memory arena + pool allocator for context objects
-static void task_initqueue(task_queue *q, int nworkers);
-static void task_deinitqueue(task_queue *q);
-static void task_submit(task_queue *q, task_callback *cb, void *arg);
-static void task_waitall(task_queue *q);
-
-typedef struct event_loop event_loop;
-typedef void event_callback(void *arg, iptr retval);
+typedef struct TaskQueue TaskQueue;
+typedef void TaskFunc(void *arg);
 
 // TODO(fmrsn): use memory arena + pool allocator for context objects
-static void event_initloop(event_loop *loop);
-static void event_deinitloop(event_loop *loop);
-static void event_tick(event_loop *loop);
-static void event_loopfor(event_loop *loop, i64 ns);
-static void event_accept(event_loop *loop, int sock, event_callback *cb, void *arg);
-static void event_close(event_loop *loop, int fd, event_callback *cb, void *arg);
-static void
-event_recv(event_loop *loop, int sock, void *buf, isize size, event_callback *cb, void *arg);
-static void
-event_send(event_loop *loop, int sock, const void *buf, isize size, event_callback *cb, void *arg);
-static void event_timeout(event_loop *loop, i64 ns, event_callback *cb, void *arg);
+static void TaskInitQueue(TaskQueue *queue, Int32 numWorkers);
+static void TaskDeinitQueue(TaskQueue *queue);
+static void TaskExecute(TaskQueue *queue, TaskFunc *func, void *arg);
+static void TaskWaitAll(TaskQueue *queue);
+
+typedef struct EventLoop EventLoop;
+typedef void EventCallback(void *arg, Ptr ret);
+
+// TODO(fmrsn): use memory arena + pool allocator for context objects
+static void EventInitLoop(EventLoop *loop);
+static void EventAccept(EventLoop *loop, int sock, EventCallback *callback, void *arg);
+static void EventClose(EventLoop *loop, int fd, EventCallback *callback, void *arg);
+static void EventRecv(
+	EventLoop *loop, int sock, void *buffer, Size bufferSize, EventCallback *callback,
+	void *arg);
+static void EventSend(
+	EventLoop *loop, int sock, const void *buffer, Size bufferSize, EventCallback *callback,
+	void *arg);
+static void EventTimer(EventLoop *loop, Int64 ns, EventCallback *callback, void *arg);
+static void EventTick(EventLoop *loop);
+static void EventLoopFor(EventLoop *loop, Int64 ns);
+static void EventDeinitLoop(EventLoop *loop);
 
 // TODO(fmrsn): operation: cancel submission
 
@@ -59,86 +61,86 @@ static void event_timeout(event_loop *loop, i64 ns, event_callback *cb, void *ar
 #include <stdlib.h>
 #include <unistd.h>
 
-typedef struct tasksubmission {
-	TAILQ_ENTRY(tasksubmission) link;
-	task_queue *queue;
-	pthread_t tid;
-	task_callback *cb;
+typedef struct taskSubmission {
+	TAILQ_ENTRY(taskSubmission) link;
+	TaskQueue *queue;
+	pthread_t thread;
+	TaskFunc *func;
 	void *arg;
-} tasksubmission;
+} taskSubmission;
 
-typedef TAILQ_HEAD(tasksubmissionlist, tasksubmission) tasksubmissionlist;
+typedef TAILQ_HEAD(taskSubmissionList, taskSubmission) taskSubmissionList;
 
-struct task_queue {
-	sigset_t fillset;
-	pthread_attr_t workerattr;
-	pthread_cond_t worktodo;
-	pthread_cond_t alldone;
+struct TaskQueue {
+	sigset_t sigfillset;
+	pthread_attr_t workerAttr;
+	pthread_cond_t workToDo;
+	pthread_cond_t allDone;
 	pthread_cond_t stopped;
 	pthread_mutex_t mutex;
-	tasksubmissionlist pending;
-	tasksubmissionlist active;
-	i32 spawned;
-	i32 idle;
-	bool waiting;
-	bool deiniting;
+	taskSubmissionList pending;
+	taskSubmissionList active;
+	Int32 spawned;
+	Int32 idle;
+	Bool waiting;
+	Bool deiniting;
 };
 
 // TODO: use memory arenas
-static tasksubmission *
-taskalloc(void)
+static taskSubmission *
+taskAlloc(void)
 {
-	tasksubmission *s = malloc(SIZEOF(*s));
+	taskSubmission *s = malloc(sizeof(*s));
 	assert(s);
 	return s;
 }
 
 static void
-taskfree(tasksubmission *s)
+taskFree(taskSubmission *s)
 {
 	free(s);
 }
 
-static void taskdone(void *arg);
-static void taskcleanup(void *arg);
+static void taskDone(void *arg);
+static void taskCleanUp(void *arg);
 
 static void *
-taskwork(void *arg)
+taskWork(void *arg)
 {
-	task_queue *queue = arg;
-	pthread_t tid = pthread_self();
+	TaskQueue *queue = arg;
+	pthread_t t = pthread_self();
 
 	(void)pthread_mutex_lock(&queue->mutex);
 	++queue->spawned;
 
-	pthread_cleanup_push(taskcleanup, queue);
+	pthread_cleanup_push(taskCleanUp, queue);
 	for (;;) {
 		/* Reset thread signals and cancellation state. */
-		(void)pthread_sigmask(SIG_SETMASK, &queue->fillset, NULL);
+		(void)pthread_sigmask(SIG_SETMASK, &queue->sigfillset, NULL);
 		(void)pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
 		(void)pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
 
 		++queue->idle;
 		while (!queue->deiniting && TAILQ_EMPTY(&queue->pending)) {
-			(void)pthread_cond_wait(&queue->worktodo, &queue->mutex);
+			(void)pthread_cond_wait(&queue->workToDo, &queue->mutex);
 		}
 		--queue->idle;
 		if (queue->deiniting) {
 			break;
 		}
 
-		tasksubmission *submission;
+		taskSubmission *submission;
 		if ((submission = TAILQ_FIRST(&queue->pending))) {
 			TAILQ_REMOVE(&queue->pending, submission, link);
 
-			submission->tid = tid;
+			submission->thread = t;
 			submission->queue = queue;
 			TAILQ_INSERT_TAIL(&queue->active, submission, link);
 
 			pthread_mutex_unlock(&queue->mutex);
 
-			pthread_cleanup_push(taskdone, submission);
-			submission->cb(submission->arg);
+			pthread_cleanup_push(taskDone, submission);
+			submission->func(submission->arg);
 			pthread_cleanup_pop(1);
 		}
 	}
@@ -148,37 +150,37 @@ taskwork(void *arg)
 }
 
 static void
-taskdone(void *arg)
+taskDone(void *arg)
 {
-	tasksubmission *submission = arg;
-	task_queue *queue = submission->queue;
+	taskSubmission *submission = arg;
+	TaskQueue *queue = submission->queue;
 
 	(void)pthread_mutex_lock(&queue->mutex);
 
 	TAILQ_REMOVE(&queue->active, submission, link);
 
-	taskfree(submission);
+	taskFree(submission);
 
 	if (!TAILQ_EMPTY(&queue->pending) || !TAILQ_EMPTY(&queue->active)) {
 		return;
 	}
 	if (queue->waiting) {
-		(void)pthread_cond_broadcast(&queue->alldone);
+		(void)pthread_cond_broadcast(&queue->allDone);
 		queue->waiting = 0;
 	}
 }
 
 static void
-taskcleanup(void *arg)
+taskCleanUp(void *arg)
 {
-	task_queue *queue = arg;
-	pthread_t tid;
+	TaskQueue *queue = arg;
+	pthread_t t;
 	int ret;
 
 	--queue->spawned;
 
 	if (!queue->deiniting) {
-		ret = pthread_create(&tid, &queue->workerattr, taskwork, queue);
+		ret = pthread_create(&t, &queue->workerAttr, taskWork, queue);
 		assert(ret == 0);
 
 	} else if (queue->spawned == 0) {
@@ -196,18 +198,18 @@ taskcleanup(void *arg)
  */
 
 static void
-task_initqueue(task_queue *queue, int nworkers)
+TaskInitQueue(TaskQueue *queue, Int32 numWorkers)
 {
-	assert(nworkers > 0);
+	assert(numWorkers > 0);
 
-	(void)sigfillset(&queue->fillset);
+	(void)sigfillset(&queue->sigfillset);
 
-	(void)pthread_attr_init(&queue->workerattr);
-	(void)pthread_attr_setdetachstate(&queue->workerattr, PTHREAD_CREATE_DETACHED);
+	(void)pthread_attr_init(&queue->workerAttr);
+	(void)pthread_attr_setdetachstate(&queue->workerAttr, PTHREAD_CREATE_DETACHED);
 
 	(void)pthread_mutex_init(&queue->mutex, NULL);
-	(void)pthread_cond_init(&queue->worktodo, NULL);
-	(void)pthread_cond_init(&queue->alldone, NULL);
+	(void)pthread_cond_init(&queue->workToDo, NULL);
+	(void)pthread_cond_init(&queue->allDone, NULL);
 	(void)pthread_cond_init(&queue->stopped, NULL);
 
 	TAILQ_INIT(&queue->pending);
@@ -218,64 +220,64 @@ task_initqueue(task_queue *queue, int nworkers)
 
 	pthread_t tid;
 	int ret;
-	for (int i = 0; i < nworkers; ++i) {
-		ret = pthread_create(&tid, &queue->workerattr, taskwork, queue);
+	for (int i = 0; i < numWorkers; ++i) {
+		ret = pthread_create(&tid, &queue->workerAttr, taskWork, queue);
 		assert(ret == 0);
 	}
 }
 
 static void
-task_submit(task_queue *queue, task_callback *cb, void *arg)
+TaskExecute(TaskQueue *queue, TaskFunc *func, void *arg)
 {
 	(void)pthread_mutex_lock(&queue->mutex);
 
-	tasksubmission *submission = taskalloc();
-	*submission = (tasksubmission){.queue = queue, .cb = cb, .arg = arg};
+	taskSubmission *s = taskAlloc();
+	*s = (taskSubmission){.queue = queue, .func = func, .arg = arg};
 
-	TAILQ_INSERT_TAIL(&queue->pending, submission, link);
+	TAILQ_INSERT_TAIL(&queue->pending, s, link);
 	if (queue->idle > 0) {
-		(void)pthread_cond_signal(&queue->worktodo);
+		(void)pthread_cond_signal(&queue->workToDo);
 	}
 
 	(void)pthread_mutex_unlock(&queue->mutex);
 }
 
 static void
-taskunlockmutex(void *mutex)
+taskUnlockMutex(void *mutex)
 {
 	(void)pthread_mutex_unlock(mutex);
 }
 
 static void
-task_waitall(task_queue *queue)
+TaskWaitAll(TaskQueue *queue)
 {
 	(void)pthread_mutex_lock(&queue->mutex);
-	pthread_cleanup_push(taskunlockmutex, &queue->mutex);
+	pthread_cleanup_push(taskUnlockMutex, &queue->mutex);
 
 	while (!TAILQ_EMPTY(&queue->pending) || !TAILQ_EMPTY(&queue->active)) {
 		queue->waiting = 1;
-		(void)pthread_cond_wait(&queue->alldone, &queue->mutex);
+		(void)pthread_cond_wait(&queue->allDone, &queue->mutex);
 	}
 
 	pthread_cleanup_pop(1);
 }
 
 static void
-task_deinitqueue(task_queue *queue)
+TaskDeinitQueue(TaskQueue *queue)
 {
 	(void)pthread_mutex_lock(&queue->mutex);
-	pthread_cleanup_push(taskunlockmutex, &queue->mutex);
+	pthread_cleanup_push(taskUnlockMutex, &queue->mutex);
 
 	queue->deiniting = 1;
-	(void)pthread_cond_broadcast(&queue->worktodo);
+	(void)pthread_cond_broadcast(&queue->workToDo);
 
-	tasksubmission *active;
+	taskSubmission *active;
 	TAILQ_FOREACH (active, &queue->active, link) {
-		(void)pthread_cancel(active->tid);
+		(void)pthread_cancel(active->thread);
 	}
 	while (!TAILQ_EMPTY(&queue->active)) {
 		queue->waiting = 1;
-		(void)pthread_cond_wait(&queue->alldone, &queue->mutex);
+		(void)pthread_cond_wait(&queue->allDone, &queue->mutex);
 	}
 
 	while (queue->spawned > 0) {
@@ -284,9 +286,9 @@ task_deinitqueue(task_queue *queue)
 
 	pthread_cleanup_pop(1);
 
-	pthread_attr_destroy(&queue->workerattr);
-	pthread_cond_destroy(&queue->worktodo);
-	pthread_cond_destroy(&queue->alldone);
+	pthread_attr_destroy(&queue->workerAttr);
+	pthread_cond_destroy(&queue->workToDo);
+	pthread_cond_destroy(&queue->allDone);
 	pthread_cond_destroy(&queue->stopped);
 	pthread_mutex_destroy(&queue->mutex);
 }
@@ -295,11 +297,11 @@ task_deinitqueue(task_queue *queue)
 
 typedef struct {
 	enum {
-		EVENTOP_ACCEPT,
-		EVENTOP_CLOSE,
-		EVENTOP_RECV,
-		EVENTOP_SEND,
-		EVENTOP_TIMEOUT,
+		eventOpAccept,
+		eventOpClose,
+		eventOpRecv,
+		eventOpSend,
+		eventOpTimer,
 	} code;
 
 	union {
@@ -313,71 +315,67 @@ typedef struct {
 
 		struct {
 			int sock;
-			void *buf;
-			isize size;
+			void *buffer;
+			Size size;
 		} recv;
 
 		struct {
 			int sock;
-			const void *buf;
-			isize size;
+			const void *buffer;
+			Size size;
 		} send;
 
 		struct {
-			i64 ns;
+			Int64 ns;
 		} timeout;
 	} args;
-} eventop;
+} eventOp;
 
-// TODO(fmrsn): use memory arena + pool allocator for context objects
-static void event_tick(event_loop *loop);
-static void event_loopfor(event_loop *loop, i64 ns);
-
-typedef struct eventsubmission {
-	eventop op;
-	iptr (*onready)(const eventop *op);
-	TAILQ_ENTRY(eventsubmission) link;
-	event_callback *callback;
+typedef struct eventSubmission {
+	TAILQ_ENTRY(eventSubmission) link;
+	eventOp op;
+	Ptr (*onReady)(const eventOp *op);
+	void (*callback)(void *arg, Ptr retValue);
 	void *arg;
-	iptr retval;
-} eventsubmission;
+	Ptr ret;
+} eventSubmission;
 
-typedef TAILQ_HEAD(eventsubmissionqueue, eventsubmission) eventsubmissionqueue;
+typedef TAILQ_HEAD(eventSubmissionQueue, eventSubmission) eventSubmissionQueue;
 
-struct event_loop {
+struct EventLoop {
 	int kq;
 	int inflight;
-	eventsubmissionqueue pending;
-	eventsubmissionqueue completed;
+	eventSubmissionQueue pending;
+	eventSubmissionQueue completed;
 };
 
 #include <signal.h>
 
-static eventsubmission *
-eventalloc(void)
+static eventSubmission *
+eventAlloc(void)
 {
-	eventsubmission *s = malloc(SIZEOF(*s));
+	eventSubmission *s = malloc(sizeof(*s));
 	assert(s);
 	return s;
 }
 
 static void
-eventfree(eventsubmission *s)
+eventFree(eventSubmission *s)
 {
 	free(s);
 }
 
 static void
-eventinit(void)
+eventInit(void)
 {
 	signal(SIGPIPE, SIG_IGN);
 }
 
 static void
-event_initloop(event_loop *loop)
+EventInitLoop(EventLoop *loop)
 {
 	static pthread_once_t once = PTHREAD_ONCE_INIT;
-	pthread_once(&once, eventinit);
+	pthread_once(&once, eventInit);
 
 	int kq = kqueue();
 	assert(kq >= 0);
@@ -389,44 +387,44 @@ event_initloop(event_loop *loop)
 }
 
 static int
-eventflushpending(
-	eventsubmissionqueue *pending, isize nevents, struct kevent events[static nevents])
+eventFlushPending(
+	eventSubmissionQueue *pending, Size maxEvents, struct kevent eventBuf[static maxEvents])
 {
-	eventsubmission *submission;
+	eventSubmission *s;
 
 	int i;
-	for (i = 0; i < nevents; ++i) {
-		if (!(submission = TAILQ_FIRST(pending))) {
+	for (i = 0; i < maxEvents; ++i) {
+		if (!(s = TAILQ_FIRST(pending))) {
 			break;
 		}
-		TAILQ_REMOVE(pending, submission, link);
+		TAILQ_REMOVE(pending, s, link);
 
-		struct kevent *event = &events[i];
+		struct kevent *event = &eventBuf[i];
 		*event = (struct kevent){
 			.flags = EV_ADD | EV_ENABLE | EV_ONESHOT,
-			.udata = submission,
+			.udata = s,
 		};
 
-		eventop *op = &submission->op;
+		eventOp *op = &s->op;
 
 		switch (op->code) {
-		case EVENTOP_ACCEPT:
+		case eventOpAccept:
 			event->ident = op->args.accept.sock;
 			event->filter = EVFILT_READ;
 			break;
 
-		case EVENTOP_RECV:
+		case eventOpRecv:
 			event->ident = op->args.recv.sock;
 			event->filter = EVFILT_READ;
 			break;
 
-		case EVENTOP_SEND:
+		case eventOpSend:
 			event->ident = op->args.send.sock;
 			event->filter = EVFILT_WRITE;
 			break;
 
-		case EVENTOP_TIMEOUT:
-			event->ident = (uptr)submission;
+		case eventOpTimer:
+			event->ident = (UPtr)s;
 			event->filter = EVFILT_TIMER;
 			event->fflags = NOTE_NSECONDS;
 			event->data = op->args.timeout.ns;
@@ -443,79 +441,79 @@ eventflushpending(
 #include <errno.h>
 
 static void
-eventflushandwait(event_loop *loop, const struct timespec *timeout)
+eventFlushAndWait(EventLoop *loop, const struct timespec *timeout)
 {
 	int kq = loop->kq;
-	eventsubmissionqueue pending = loop->pending;
-	eventsubmissionqueue completed = loop->completed;
+	eventSubmissionQueue pending = loop->pending;
+	eventSubmissionQueue completed = loop->completed;
 
 	struct kevent events[256];
-	int nchanges = eventflushpending(&pending, COUNTOF(events), events);
+	int numChanges = eventFlushPending(&pending, CountOf(events), events);
 
-	if (nchanges > 0 || (TAILQ_EMPTY(&completed) && loop->inflight > 0)) {
-		int nevents = kevent(kq, events, nchanges, events, COUNTOF(events), timeout);
-		assert(nevents >= 0);
+	if (numChanges > 0 || (TAILQ_EMPTY(&completed) && loop->inflight > 0)) {
+		int numEvents = kevent(kq, events, numChanges, events, CountOf(events), timeout);
+		assert(numEvents >= 0);
 
 		loop->pending = pending;
-		loop->inflight += nchanges - nevents;
+		loop->inflight += numChanges - numEvents;
 
-		for (int i = 0; i < nevents; ++i) {
+		for (int i = 0; i < numEvents; ++i) {
 			struct kevent *event = &events[i];
-			eventsubmission *submission = event->udata;
+			eventSubmission *s = event->udata;
 
-			submission->retval = event->fflags & EV_ERROR ? -event->data : 0;
-			TAILQ_INSERT_TAIL(&completed, submission, link);
+			s->ret = event->fflags & EV_ERROR ? -event->data : 0;
+			TAILQ_INSERT_TAIL(&completed, s, link);
 		}
 	}
 
 	TAILQ_INIT(&loop->completed);
 
-	eventsubmission *submission;
-	while ((submission = TAILQ_FIRST(&completed))) {
-		TAILQ_REMOVE(&completed, submission, link);
+	eventSubmission *s;
+	while ((s = TAILQ_FIRST(&completed))) {
+		TAILQ_REMOVE(&completed, s, link);
 
-		if (submission->retval >= 0 && submission->onready) {
-			submission->retval = submission->onready(&submission->op);
+		if (s->ret >= 0 && s->onReady) {
+			s->ret = s->onReady(&s->op);
 		}
-		if (submission->retval == -EAGAIN || submission->retval == -EWOULDBLOCK) {
-			TAILQ_INSERT_TAIL(&pending, submission, link);
+		if (s->ret == -EAGAIN || s->ret == -EWOULDBLOCK) {
+			TAILQ_INSERT_TAIL(&pending, s, link);
 			continue;
 		}
 
-		event_callback *cb = submission->callback;
-		void *arg = submission->arg;
-		iptr retval = submission->retval;
-		eventfree(submission);
+		EventCallback *callback = s->callback;
+		void *arg = s->arg;
+		Ptr ret = s->ret;
+		eventFree(s);
 
-		if (cb) {
-			cb(arg, retval);
+		if (callback) {
+			callback(arg, ret);
 		}
 	}
 }
 
 static void
-event_tick(event_loop *loop)
+EventTick(EventLoop *loop)
 {
-	eventflushandwait(loop, &(struct timespec){0});
+	eventFlushAndWait(loop, &(struct timespec){0});
 }
 
 static void
-eventloopdone(void *arg, iptr retval)
+eventLoopDone(void *arg, Ptr ret)
 {
-	(void)retval;
+	(void)ret;
 
-	int *done = arg;
+	Bool *done = arg;
 	*done = 1;
 }
 
 static void
-event_loopfor(event_loop *loop, i64 ns)
+EventLoopFor(EventLoop *loop, Int64 ns)
 {
-	int done = 0;
+	Bool done = 0;
 
-	event_timeout(loop, ns, eventloopdone, &done);
+	EventTimer(loop, ns, eventLoopDone, &done);
 	while (!done) {
-		eventflushandwait(loop, NULL);
+		eventFlushAndWait(loop, NULL);
 	}
 }
 
@@ -525,19 +523,17 @@ event_loopfor(event_loop *loop, i64 ns)
 #include <unistd.h>
 
 static void
-eventsubmit(eventsubmissionqueue *queue, eventsubmission *submission)
+eventSubmit(eventSubmissionQueue *queue, eventSubmission *submission)
 {
-	eventsubmission *s = eventalloc();
+	eventSubmission *s = eventAlloc();
 	*s = *submission;
 	TAILQ_INSERT_TAIL(queue, s, link);
 }
 
-static iptr
-eventacceptonready(const eventop *op)
+static Ptr
+eventAcceptOnReady(const eventOp *op)
 {
-	assert(op->code == EVENTOP_ACCEPT);
-
-	int r;
+	assert(op->code == eventOpAccept);
 
 	int sock = accept(op->args.accept.sock, NULL, NULL);
 	if (sock < 0) {
@@ -547,30 +543,30 @@ eventacceptonready(const eventop *op)
 	int flags = fcntl(sock, F_GETFL);
 	fcntl(sock, F_SETFL, flags | O_NONBLOCK);
 
-	r = setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &(int){1}, sizeof(int));
-	assert(r == 0);
+	int ret = setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &(int){1}, sizeof(int));
+	assert(ret == 0);
 
 	return sock;
 }
 
 static void
-event_accept(event_loop *loop, int sock, event_callback *cb, void *arg)
+EventAccept(EventLoop *loop, int sock, EventCallback *callback, void *arg)
 {
-	eventsubmit(
+	eventSubmit(
 		&loop->completed,
-		&(eventsubmission){
-			.op.code = EVENTOP_ACCEPT,
+		&(eventSubmission){
+			.op.code = eventOpAccept,
 			.op.args.accept.sock = sock,
-			.onready = eventacceptonready,
-			.callback = cb,
+			.onReady = eventAcceptOnReady,
+			.callback = callback,
 			.arg = arg,
 		});
 }
 
-static iptr
-eventcloseonready(const eventop *op)
+static Ptr
+eventCloseOnReady(const eventOp *op)
 {
-	assert(op->code == EVENTOP_CLOSE);
+	assert(op->code == eventOpClose);
 
 	if (close(op->args.close.fd) < 0) {
 		return -errno;
@@ -579,92 +575,92 @@ eventcloseonready(const eventop *op)
 }
 
 static void
-event_close(event_loop *loop, int fd, event_callback *cb, void *arg)
+EventClose(EventLoop *loop, int fd, EventCallback *callback, void *arg)
 {
-	eventsubmit(
+	eventSubmit(
 		&loop->completed,
-		&(eventsubmission){
-			.op.code = EVENTOP_CLOSE,
+		&(eventSubmission){
+			.op.code = eventOpClose,
 			.op.args.close.fd = fd,
-			.onready = eventcloseonready,
-			.callback = cb,
+			.onReady = eventCloseOnReady,
+			.callback = callback,
 			.arg = arg,
 		});
 }
 
-static iptr
-eventrecvonready(const eventop *op)
+static Ptr
+eventRecvOnReady(const eventOp *op)
 {
-	assert(op->code == EVENTOP_RECV);
+	assert(op->code == eventOpRecv);
 
 	int sock = op->args.recv.sock;
-	void *buffer = op->args.recv.buf;
-	isize bufferSize = op->args.recv.size;
+	void *buffer = op->args.recv.buffer;
+	Size size = op->args.recv.size;
 
-	ssize_t n = recv(sock, buffer, bufferSize, 0);
+	ssize_t n = recv(sock, buffer, size, 0);
 	return n < 0 ? -errno : n;
 }
 
 static void
-event_recv(event_loop *loop, int sock, void *buf, isize size, event_callback *cb, void *arg)
+EventRecv(EventLoop *loop, int sock, void *buf, Size size, EventCallback *callback, void *arg)
 {
-	eventsubmit(
+	eventSubmit(
 		&loop->completed,
-		&(eventsubmission){
-			.op.code = EVENTOP_RECV,
+		&(eventSubmission){
+			.op.code = eventOpRecv,
 			.op.args.recv.sock = sock,
-			.op.args.recv.buf = buf,
+			.op.args.recv.buffer = buf,
 			.op.args.recv.size = size,
-			.onready = eventrecvonready,
-			.callback = cb,
+			.onReady = eventRecvOnReady,
+			.callback = callback,
 			.arg = arg,
 		});
 }
 
-static iptr
-eventsendonready(const eventop *op)
+static Ptr
+eventSendOnReady(const eventOp *op)
 {
-	assert(op->code == EVENTOP_SEND);
+	assert(op->code == eventOpSend);
 
 	int sock = op->args.recv.sock;
-	const void *buffer = op->args.recv.buf;
-	isize bufferSize = op->args.recv.size;
+	const void *buffer = op->args.recv.buffer;
+	Size size = op->args.recv.size;
 
-	ssize_t n = send(sock, buffer, bufferSize, 0);
+	ssize_t n = send(sock, buffer, size, 0);
 	return n < 0 ? -errno : n;
 }
 
 static void
-event_send(event_loop *loop, int sock, const void *buf, isize size, event_callback *cb, void *arg)
+EventSend(EventLoop *loop, int sock, const void *buf, Size size, EventCallback *callback, void *arg)
 {
-	eventsubmit(
+	eventSubmit(
 		&loop->completed,
-		&(eventsubmission){
-			.op.code = EVENTOP_SEND,
+		&(eventSubmission){
+			.op.code = eventOpSend,
 			.op.args.send.sock = sock,
-			.op.args.send.buf = buf,
+			.op.args.send.buffer = buf,
 			.op.args.send.size = size,
-			.onready = eventsendonready,
-			.callback = cb,
+			.onReady = eventSendOnReady,
+			.callback = callback,
 			.arg = arg,
 		});
 }
 
 static void
-event_timeout(event_loop *loop, i64 ns, event_callback *cb, void *arg)
+EventTimer(EventLoop *loop, Int64 ns, EventCallback *callback, void *arg)
 {
-	eventsubmit(
+	eventSubmit(
 		&loop->pending,
-		&(eventsubmission){
-			.op.code = EVENTOP_TIMEOUT,
+		&(eventSubmission){
+			.op.code = eventOpTimer,
 			.op.args.timeout.ns = ns,
-			.callback = cb,
+			.callback = callback,
 			.arg = arg,
 		});
 }
 
 static void
-event_deinitloop(event_loop *loop)
+EventDeinitLoop(EventLoop *loop)
 {
 	(void)close(loop->kq);
 }
@@ -675,11 +671,11 @@ event_deinitloop(event_loop *loop)
 #include <stdio.h>
 #include <unistd.h>
 
-static task_queue taskqueue;
-static event_loop eventloop;
+static TaskQueue taskqueue;
+static EventLoop eventloop;
 
 void
-hello(void *arg)
+Hello(void *arg)
 {
 	printf("Hello from worker %d\n", (int)(intptr_t)arg);
 }
@@ -687,22 +683,22 @@ hello(void *arg)
 int
 main(void)
 {
-	(void)event_tick;
-	(void)event_loopfor;
-	(void)event_accept;
-	(void)event_close;
-	(void)event_recv;
-	(void)event_send;
+	(void)EventTick;
+	(void)EventLoopFor;
+	(void)EventAccept;
+	(void)EventClose;
+	(void)EventRecv;
+	(void)EventSend;
 
-	task_initqueue(&taskqueue, 4);
-	event_initloop(&eventloop);
+	TaskInitQueue(&taskqueue, 4);
+	EventInitLoop(&eventloop);
 
 	for (int i = 0; i < 5; ++i) {
-		task_submit(&taskqueue, hello, (void *)(iptr)i);
+		TaskExecute(&taskqueue, Hello, (void *)(Ptr)i);
 	}
 
-	task_waitall(&taskqueue);
+	TaskWaitAll(&taskqueue);
 
-	event_deinitloop(&eventloop);
-	task_deinitqueue(&taskqueue);
+	EventDeinitLoop(&eventloop);
+	TaskDeinitQueue(&taskqueue);
 }
