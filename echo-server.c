@@ -769,15 +769,8 @@ loop(void *arg)
 {
 	(void)arg;
 
-	EventLoopForNs(&eventLoop, 10L * 1000L * 1000L); // 10 ms
+	EventLoopForNs(&eventLoop, 100L * 1000L * 1000L); // 100 ms
 	TaskExecute(&taskQueue, loop, NULL);
-}
-
-static void
-hello(void *arg)
-{
-	(void)arg;
-	fprintf(stderr, "hello\n");
 }
 
 int
