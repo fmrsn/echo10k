@@ -32,6 +32,7 @@ static void TaskInitQueue(TaskQueue *queue, Int numWorkers);
 static void TaskDeinitQueue(TaskQueue *queue);
 static void TaskExecute(TaskQueue *queue, TaskFunc *func, void *funcArg);
 static void TaskWaitAll(TaskQueue *queue);
+// TODO(fmrsn): static void TaskCancel(???);
 
 typedef struct EventLoop EventLoop;
 typedef void EventCallback(void *arg, Ptr ret);
@@ -77,7 +78,7 @@ typedef struct taskSubmission {
 	void *funcArg;
 } taskSubmission;
 
-typedef TAILQ_HEAD(taskSubmissionList, taskSubmission) taskSubmissionList;
+typedef TAILQ_HEAD(, taskSubmission) taskSubmissionQueue;
 
 struct TaskQueue {
 	sigset_t sigfillset;
@@ -86,8 +87,8 @@ struct TaskQueue {
 	pthread_cond_t allDone;
 	pthread_cond_t stopped;
 	pthread_mutex_t mutex;
-	taskSubmissionList pending;
-	taskSubmissionList active;
+	taskSubmissionQueue pending;
+	taskSubmissionQueue active;
 	Int spawned;
 	Int idle;
 	Bool waiting;
@@ -138,20 +139,21 @@ taskWork(void *arg)
 			break;
 		}
 
-		taskSubmission *s;
-		if ((s = TAILQ_FIRST(&queue->pending))) {
-			TAILQ_REMOVE(&queue->pending, s, link);
-
-			s->thread = t;
-			s->queue = queue;
-			TAILQ_INSERT_TAIL(&queue->active, s, link);
-
-			pthread_mutex_unlock(&queue->mutex);
-
-			pthread_cleanup_push(taskDone, s);
-			s->func(s->funcArg);
-			pthread_cleanup_pop(1);
+		taskSubmission *submission = TAILQ_FIRST(&queue->pending);
+		if (!submission) {
+			continue;
 		}
+		TAILQ_REMOVE(&queue->pending, submission, link);
+
+		submission->thread = t;
+		submission->queue = queue;
+		TAILQ_INSERT_TAIL(&queue->active, submission, link);
+
+		pthread_mutex_unlock(&queue->mutex);
+
+		pthread_cleanup_push(taskDone, submission);
+		submission->func(submission->funcArg);
+		pthread_cleanup_pop(1);
 	}
 	pthread_cleanup_pop(1);
 
@@ -233,10 +235,9 @@ TaskInitQueue(TaskQueue *queue, Int numWorkers)
 	queue->idle = 0;
 	queue->spawned = 0;
 
-	pthread_t tid;
-	int ret;
 	for (Int i = 0; i < numWorkers; ++i) {
-		ret = pthread_create(&tid, &queue->workerAttr, taskWork, queue);
+		pthread_t thread;
+		int ret = pthread_create(&thread, &queue->workerAttr, taskWork, queue);
 		Assert(ret == 0);
 	}
 }
@@ -244,16 +245,16 @@ TaskInitQueue(TaskQueue *queue, Int numWorkers)
 static void
 TaskExecute(TaskQueue *queue, TaskFunc *func, void *funcArg)
 {
-	(void)pthread_mutex_lock(&queue->mutex);
-
-	taskSubmission *s = taskAlloc();
-	*s = (taskSubmission){
+	taskSubmission *submission = taskAlloc();
+	*submission = (taskSubmission){
 		.queue = queue,
 		.func = func,
 		.funcArg = funcArg,
 	};
 
-	TAILQ_INSERT_TAIL(&queue->pending, s, link);
+	(void)pthread_mutex_lock(&queue->mutex);
+
+	TAILQ_INSERT_TAIL(&queue->pending, submission, link);
 	if (queue->idle > 0) {
 		(void)pthread_cond_signal(&queue->workToDo);
 	}
@@ -266,12 +267,10 @@ TaskWaitAll(TaskQueue *queue)
 {
 	(void)pthread_mutex_lock(&queue->mutex);
 	pthread_cleanup_push(taskUnlockMutex, &queue->mutex);
-
 	while (!TAILQ_EMPTY(&queue->pending) || !TAILQ_EMPTY(&queue->active)) {
 		queue->waiting = 1;
 		(void)pthread_cond_wait(&queue->allDone, &queue->mutex);
 	}
-
 	pthread_cleanup_pop(1);
 }
 
@@ -342,16 +341,20 @@ typedef struct {
 	} args;
 } eventOp;
 
+/*****************************/
+
 typedef struct eventSubmission {
-	TAILQ_ENTRY(eventSubmission) link;
+	STAILQ_ENTRY(eventSubmission) link;
+
 	eventOp op;
 	Ptr (*onReady)(const eventOp *op);
 	void (*callback)(void *arg, Ptr ret);
 	void *callbackArg;
 	Ptr ret;
+
 } eventSubmission;
 
-typedef TAILQ_HEAD(eventSubmissionQueue, eventSubmission) eventSubmissionQueue;
+typedef STAILQ_HEAD(, eventSubmission) eventSubmissionQueue;
 
 struct EventLoop {
 	int kq;
@@ -360,46 +363,22 @@ struct EventLoop {
 	eventSubmissionQueue completed;
 };
 
-static eventSubmission *
-eventAlloc(void)
-{
-	eventSubmission *s = malloc(SizeOf(*s));
-	Assert(s);
-	return s;
-}
-
-static void
-eventFree(eventSubmission *s)
-{
-	free(s);
-}
-
-static void
-eventInit(void)
-{
-	signal(SIGPIPE, SIG_IGN);
-}
-
 static int
 eventFlushPending(
 	eventSubmissionQueue *pending, int maxEvents, struct kevent eventBuf[static maxEvents])
 {
-	eventSubmission *s;
-
 	int i;
-	for (i = 0; i < maxEvents; ++i) {
-		if (!(s = TAILQ_FIRST(pending))) {
-			break;
-		}
-		TAILQ_REMOVE(pending, s, link);
+	for (i = 0; i < maxEvents && !STAILQ_EMPTY(pending); ++i) {
+		eventSubmission *submission = STAILQ_FIRST(pending);
+		STAILQ_REMOVE_HEAD(pending, link);
 
 		struct kevent *event = &eventBuf[i];
 		*event = (struct kevent){
 			.flags = EV_ADD | EV_ENABLE | EV_ONESHOT,
-			.udata = s,
+			.udata = submission,
 		};
 
-		eventOp *op = &s->op;
+		eventOp *op = &submission->op;
 
 		switch (op->code) {
 		case eventOpAccept:
@@ -418,7 +397,7 @@ eventFlushPending(
 			break;
 
 		case eventOpTimer:
-			event->ident = (UPtr)s;
+			event->ident = (UPtr)submission;
 			event->filter = EVFILT_TIMER;
 			event->fflags = NOTE_NSECONDS;
 			event->data = op->args.timer.ns;
@@ -435,50 +414,42 @@ eventFlushPending(
 static void
 eventFlushAndWait(EventLoop *loop, const struct timespec *timeout)
 {
-	int kq = loop->kq;
-	eventSubmissionQueue pending = loop->pending;
-	eventSubmissionQueue completed = loop->completed;
-
 	struct kevent events[256];
-	int numChanges = eventFlushPending(&pending, CountOf(events), events);
+	int numChanges = eventFlushPending(&loop->pending, CountOf(events), events);
 
-	eventSubmission *s;
-
-	if (numChanges > 0 || (TAILQ_EMPTY(&completed) && loop->inflight > 0)) {
-		int numEvents = kevent(kq, events, numChanges, events, CountOf(events), timeout);
+	if (numChanges > 0 || (STAILQ_EMPTY(&loop->completed) && loop->inflight > 0)) {
+		int numEvents =
+			kevent(loop->kq, events, numChanges, events, CountOf(events), timeout);
 		Assert(numEvents >= 0);
 
-		loop->pending = pending;
 		loop->inflight += numChanges - numEvents;
 
 		for (int i = 0; i < numEvents; ++i) {
 			struct kevent *event = &events[i];
-			s = event->udata;
-			s->ret = event->fflags & EV_ERROR ? -event->data : 0;
-			TAILQ_INSERT_TAIL(&completed, s, link);
+			eventSubmission *submission = event->udata;
+			submission->ret = event->fflags & EV_ERROR ? -event->data : 0;
+			STAILQ_INSERT_TAIL(&loop->completed, submission, link);
 		}
 	}
 
-	TAILQ_INIT(&loop->completed);
+	eventSubmission *lastCompleted = STAILQ_LAST(&loop->completed, eventSubmission, link);
+	eventSubmission *completed = NULL;
+	while (completed != lastCompleted && (completed = STAILQ_FIRST(&loop->completed))) {
+		STAILQ_REMOVE_HEAD(&loop->completed, link);
 
-	while ((s = TAILQ_FIRST(&completed))) {
-		TAILQ_REMOVE(&completed, s, link);
-
-		if (s->ret >= 0 && s->onReady) {
-			s->ret = s->onReady(&s->op);
-		}
-		if (s->ret == -EAGAIN || s->ret == -EWOULDBLOCK) {
-			TAILQ_INSERT_TAIL(&pending, s, link);
-			continue;
+		if (completed->ret >= 0 && completed->onReady) {
+			completed->ret = completed->onReady(&completed->op);
 		}
 
-		EventCallback *callback = s->callback;
-		void *arg = s->callbackArg;
-		Ptr ret = s->ret;
-		eventFree(s);
+		Bool tryAgain = completed->ret == -EAGAIN || completed->ret == -EWOULDBLOCK;
+		if (tryAgain) {
+			STAILQ_INSERT_TAIL(&loop->pending, completed, link);
+		} else if (completed->callback) {
+			completed->callback(completed->callbackArg, completed->ret);
+		}
 
-		if (callback) {
-			callback(arg, ret);
+		if (!tryAgain) {
+			free(completed);
 		}
 	}
 }
@@ -486,16 +457,15 @@ eventFlushAndWait(EventLoop *loop, const struct timespec *timeout)
 static void
 EventInitLoop(EventLoop *loop)
 {
-	static pthread_once_t once = PTHREAD_ONCE_INIT;
-	pthread_once(&once, eventInit);
+	Assert(loop);
 
 	int kq = kqueue();
 	Assert(kq >= 0);
 
 	loop->kq = kq;
 	loop->inflight = 0;
-	TAILQ_INIT(&loop->pending);
-	TAILQ_INIT(&loop->completed);
+	STAILQ_INIT(&loop->pending);
+	STAILQ_INIT(&loop->completed);
 }
 
 static void
@@ -525,19 +495,40 @@ EventLoopForNs(EventLoop *loop, Long ns)
 }
 
 static void
-eventSubmit(eventSubmissionQueue *queue, eventSubmission *submission)
+eventSubmit(eventSubmissionQueue *queue, eventSubmission *desc)
 {
-	eventSubmission *s = eventAlloc();
-	*s = *submission;
-	TAILQ_INSERT_TAIL(queue, s, link);
+	eventSubmission *submission = malloc(SizeOf(*submission));
+	Assert(submission);
+	*submission = *desc;
+
+	STAILQ_INSERT_TAIL(queue, submission, link);
+}
+
+static Ptr eventAcceptOnReady(const eventOp *);
+static Ptr eventCloseOnReady(const eventOp *);
+static Ptr eventRecvOnReady(const eventOp *);
+static Ptr eventSendOnReady(const eventOp *);
+
+static void
+EventAccept(EventLoop *loop, int sock, EventCallback *callback, void *callbackArg)
+{
+	eventSubmit(
+		&loop->completed,
+		&(eventSubmission){
+			.op.code = eventOpAccept,
+			.op.args.accept = {sock},
+			.onReady = eventAcceptOnReady,
+			.callback = callback,
+			.callbackArg = callbackArg,
+		});
 }
 
 static Ptr
 eventAcceptOnReady(const eventOp *op)
 {
-	Assert(op->code == eventOpAccept);
+	int listenSock = op->args.accept.sock;
 
-	int sock = accept(op->args.accept.sock, NULL, NULL);
+	int sock = accept(listenSock, NULL, NULL);
 	if (sock < 0) {
 		return -errno;
 	}
@@ -545,35 +536,11 @@ eventAcceptOnReady(const eventOp *op)
 	int flags = fcntl(sock, F_GETFL);
 	fcntl(sock, F_SETFL, flags | O_NONBLOCK);
 
-	int ret = setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &(int){1}, sizeof(int));
-	Assert(ret == 0);
+	// TODO: move to echoSetup
+	int r = setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &(int){1}, sizeof(int));
+	Assert(r == 0);
 
 	return sock;
-}
-
-static void
-EventAccept(EventLoop *loop, int sock, EventCallback *callback, void *arg)
-{
-	eventSubmit(
-		&loop->completed,
-		&(eventSubmission){
-			.op.code = eventOpAccept,
-			.op.args.accept.sock = sock,
-			.onReady = eventAcceptOnReady,
-			.callback = callback,
-			.callbackArg = arg,
-		});
-}
-
-static Ptr
-eventCloseOnReady(const eventOp *op)
-{
-	Assert(op->code == eventOpClose);
-
-	if (close(op->args.close.fd) < 0) {
-		return -errno;
-	}
-	return 0;
 }
 
 static void
@@ -583,8 +550,35 @@ EventClose(EventLoop *loop, int fd, EventCallback *callback, void *callbackArg)
 		&loop->completed,
 		&(eventSubmission){
 			.op.code = eventOpClose,
-			.op.args.close.fd = fd,
+			.op.args.close = {fd},
 			.onReady = eventCloseOnReady,
+			.callback = callback,
+			.callbackArg = callbackArg,
+		});
+}
+
+static Ptr
+eventCloseOnReady(const eventOp *op)
+{
+	int fd = op->args.close.fd;
+
+	int r = close(fd);
+	return r < 0 ? -errno : 0;
+}
+
+static void
+EventRecv(
+	EventLoop *loop, int sock, void *buffer, Size bufferSize, EventCallback *callback,
+	void *callbackArg)
+{
+	Assert(bufferSize >= 0);
+
+	eventSubmit(
+		&loop->completed,
+		&(eventSubmission){
+			.op.code = eventOpRecv,
+			.op.args.recv = {sock, buffer, bufferSize},
+			.onReady = eventRecvOnReady,
 			.callback = callback,
 			.callbackArg = callbackArg,
 		});
@@ -593,8 +587,6 @@ EventClose(EventLoop *loop, int fd, EventCallback *callback, void *callbackArg)
 static Ptr
 eventRecvOnReady(const eventOp *op)
 {
-	Assert(op->code == eventOpRecv);
-
 	int sock = op->args.recv.sock;
 	void *buffer = op->args.recv.buffer;
 	Size bufferSize = op->args.recv.bufferSize;
@@ -604,19 +596,18 @@ eventRecvOnReady(const eventOp *op)
 }
 
 static void
-EventRecv(
-	EventLoop *loop, int sock, void *buffer, Size bufferSize, EventCallback *callback,
+EventSend(
+	EventLoop *loop, int sock, const void *buffer, Size bufferSize, EventCallback *callback,
 	void *callbackArg)
 {
 	Assert(bufferSize >= 0);
+
 	eventSubmit(
 		&loop->completed,
 		&(eventSubmission){
-			.op.code = eventOpRecv,
-			.op.args.recv.sock = sock,
-			.op.args.recv.buffer = buffer,
-			.op.args.recv.bufferSize = bufferSize,
-			.onReady = eventRecvOnReady,
+			.op.code = eventOpSend,
+			.op.args.send = {sock, buffer, bufferSize},
+			.onReady = eventSendOnReady,
 			.callback = callback,
 			.callbackArg = callbackArg,
 		});
@@ -625,44 +616,24 @@ EventRecv(
 static Ptr
 eventSendOnReady(const eventOp *op)
 {
-	Assert(op->code == eventOpSend);
-
-	int sock = op->args.recv.sock;
-	const void *buffer = op->args.recv.buffer;
-	Size bufferSize = op->args.recv.bufferSize;
+	int sock = op->args.send.sock;
+	const void *buffer = op->args.send.buffer;
+	Size bufferSize = op->args.send.bufferSize;
 
 	ssize_t n = send(sock, buffer, bufferSize, 0);
 	return n < 0 ? -errno : n;
 }
 
 static void
-EventSend(
-	EventLoop *loop, int sock, const void *buffer, Size bufferSize, EventCallback *callback,
-	void *callbackArg)
-{
-	Assert(bufferSize >= 0);
-	eventSubmit(
-		&loop->completed,
-		&(eventSubmission){
-			.op.code = eventOpSend,
-			.op.args.send.sock = sock,
-			.op.args.send.buffer = buffer,
-			.op.args.send.bufferSize = bufferSize,
-			.onReady = eventSendOnReady,
-			.callback = callback,
-			.callbackArg = callbackArg,
-		});
-}
-
-static void
 EventTimer(EventLoop *loop, Long ns, EventCallback *callback, void *callbackArg)
 {
 	Assert(ns >= 0);
+
 	eventSubmit(
-		&loop->pending,
+		&loop->completed,
 		&(eventSubmission){
 			.op.code = eventOpTimer,
-			.op.args.timer.ns = ns,
+			.op.args.timer = {ns},
 			.callback = callback,
 			.callbackArg = callbackArg,
 		});
@@ -671,38 +642,193 @@ EventTimer(EventLoop *loop, Long ns, EventCallback *callback, void *callbackArg)
 static void
 EventDeinitLoop(EventLoop *loop)
 {
+	// TODO: we're leaking memory alloc'ed for submissions. Fix it.
 	(void)close(loop->kq);
 }
 
 /***********************************************************************/
 
+#include <netdb.h>
+
+#include <locale.h>
 #include <stdio.h>
 
 static TaskQueue taskQueue;
 static EventLoop eventLoop;
 
-void
-Hello(void *arg)
+typedef struct echoContext {
+	EventLoop *loop;
+	int sock;
+
+	char *content;
+	Size contentSize;
+	char contentBuf[8192];
+} echoContext;
+
+static echoContext *
+echoAlloc(void)
 {
-	printf("Hello from worker %d\n", (int)(Ptr)arg);
+	echoContext *ctx = malloc(SizeOf(*ctx));
+	Assert(ctx);
+	return ctx;
+}
+
+static void
+echoFree(echoContext *ctx)
+{
+	free(ctx);
+}
+
+static void echoOnAccept(void *arg, Ptr ret);
+static void echoOnRecv(void *arg, Ptr ret);
+static void echoOnSend(void *arg, Ptr ret);
+static void echoOnClose(void *arg, Ptr ret);
+
+static void
+echoOnAccept(void *arg, Ptr ret)
+{
+	int r;
+
+	if (ret < 0) {
+		// TODO(fmrsn): Should we close the listening connection?
+		return;
+	}
+
+	echoContext *listenCtx = arg;
+	int sock = ret;
+
+	int flags = fcntl(sock, F_GETFL);
+	(void)fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+
+	r = setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &(int){1}, SizeOf(int));
+	Assert(r >= 0);
+
+	echoContext *ctx = echoAlloc();
+	*ctx = (echoContext){
+		.loop = listenCtx->loop,
+		.sock = sock,
+	};
+
+	EventRecv(ctx->loop, sock, ctx->contentBuf, CountOf(ctx->contentBuf), echoOnRecv, ctx);
+
+	EventAccept(listenCtx->loop, listenCtx->sock, echoOnAccept, listenCtx);
+}
+
+static void
+echoOnRecv(void *arg, Ptr ret)
+{
+	echoContext *ctx = arg;
+
+	if (ret <= 0) {
+		// TODO(fmrsn): log error if ret < 0
+		EventClose(ctx->loop, ctx->sock, echoOnClose, ctx);
+		return;
+	}
+
+	ctx->content = ctx->contentBuf;
+	ctx->contentSize = ret;
+
+	EventSend(ctx->loop, ctx->sock, ctx->contentBuf, ctx->contentSize, echoOnSend, ctx);
+}
+
+static void
+echoOnSend(void *arg, Ptr ret)
+{
+	echoContext *ctx = arg;
+
+	if (ret < 0) {
+		// TODO(fmrsn): log error if ret != -EPIPE
+		EventClose(ctx->loop, ctx->sock, echoOnClose, ctx);
+		return;
+	}
+
+	Size numSent = ret;
+	ctx->content += numSent;
+	ctx->contentSize -= numSent;
+
+	if (ctx->contentSize > 0) {
+		EventSend(ctx->loop, ctx->sock, ctx->content, ctx->contentSize, echoOnSend, ctx);
+	} else {
+		EventRecv(
+			ctx->loop, ctx->sock, ctx->contentBuf, CountOf(ctx->contentBuf), echoOnRecv,
+			ctx);
+	}
+}
+
+static void
+echoOnClose(void *arg, Ptr ret)
+{
+	(void)ret;
+
+	echoContext *ctx = arg;
+	echoFree(ctx);
+}
+
+static void
+loop(void *arg)
+{
+	(void)arg;
+
+	EventLoopForNs(&eventLoop, 10L * 1000L * 1000L); // 10 ms
+	TaskExecute(&taskQueue, loop, NULL);
+}
+
+static void
+hello(void *arg)
+{
+	(void)arg;
+	fprintf(stderr, "hello\n");
 }
 
 int
 main(void)
 {
+	// NOTE(fmrsn): We don't use this function (yet).
 	(void)EventTick;
-	(void)EventLoopForNs;
-	(void)EventAccept;
-	(void)EventClose;
-	(void)EventRecv;
-	(void)EventSend;
 
-	TaskInitQueue(&taskQueue, 4);
+	int r;
+
+	srand(time(NULL) ^ getpid());
+	setlocale(LC_ALL, "C");
+	signal(SIGPIPE, SIG_IGN);
+
+	TaskInitQueue(&taskQueue, 1);
 	EventInitLoop(&eventLoop);
 
-	for (int i = 0; i < 5; ++i) {
-		TaskExecute(&taskQueue, Hello, (void *)(Ptr)i);
+	struct addrinfo hints = {
+		.ai_family = AF_UNSPEC,
+		.ai_socktype = SOCK_STREAM,
+		.ai_flags = AI_PASSIVE,
+	};
+	struct addrinfo *addrinfo;
+	r = getaddrinfo("localhost", "8080", &hints, &addrinfo);
+	Assert(r == 0);
+
+	for (struct addrinfo *ai = addrinfo; ai; ai = ai->ai_next) {
+		int sock = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+		Assert(sock != -1);
+
+		int flags = fcntl(sock, F_GETFL);
+		fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+
+		r = setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &(int){1}, SizeOf(int));
+		Assert(r != -1);
+
+		r = bind(sock, ai->ai_addr, ai->ai_addrlen);
+		Assert(r != -1);
+
+		r = listen(sock, SOMAXCONN);
+		Assert(r != -1);
+
+		echoContext *listenCtx = echoAlloc();
+		listenCtx->loop = &eventLoop;
+		listenCtx->sock = sock;
+		EventAccept(&eventLoop, sock, echoOnAccept, listenCtx);
 	}
+
+	freeaddrinfo(addrinfo);
+
+	TaskExecute(&taskQueue, loop, NULL);
 
 	TaskWaitAll(&taskQueue);
 
