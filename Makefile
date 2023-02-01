@@ -5,16 +5,16 @@ CC = cc
 CFLAGS = -Os
 LDFLAGS =
 
-echo-server: echo-server.c
+echo10k: echo10k.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS) -pthread
 
-echo-server-debug: echo-server.c
+echo10k-debug: echo10k.c
 	$(CC) -std=c99 -O0 -g3 -Wall -Wextra -pedantic -o $@ $< -pthread
 
-debug: echo-server-debug FORCE
+debug: echo10k-debug FORCE
 	lldb $<
 
 clean: FORCE
-	rm -f echo-server echo-server-debug
+	rm -f echo10k echo10k-debug *.dSYM
 
 FORCE: ;

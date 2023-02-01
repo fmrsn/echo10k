@@ -1,4 +1,4 @@
-echo-server
-echo-server-debug
-echo-bench
+echo10k
+echo10k-debug
+echo10k-bench
 *.dSYM
