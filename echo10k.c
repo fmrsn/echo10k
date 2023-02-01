@@ -309,6 +309,8 @@ task_deinit_queue(TaskQueue *queue)
 	pthread_mutex_destroy(&queue->mutex);
 }
 
+/*****************************/
+
 typedef struct {
 	enum {
 		EVENT_OP_ACCEPT,
@@ -344,8 +346,6 @@ typedef struct {
 		} timer;
 	} args;
 } EventOp;
-
-/*****************************/
 
 typedef struct EventCompletion {
 	STAILQ_ENTRY(EventCompletion) link;
