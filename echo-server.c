@@ -23,6 +23,8 @@ typedef Int Bool;
 // TODO(fmrsn): Remove stdlib dependency
 #include <assert.h> // assert(x)
 
+#define unreachable() assert(!"unreachable")
+
 typedef struct TaskQueue TaskQueue;
 typedef void TaskFunc(void *arg);
 
@@ -80,7 +82,7 @@ typedef TAILQ_HEAD(, TaskSubmission) TaskSubmissionQueue;
 
 struct TaskQueue {
 	sigset_t sigfillset;
-	pthread_attr_t worker_attr;
+	pthread_attr_t workerattr;
 	pthread_cond_t newtask;
 	pthread_cond_t alldone;
 	pthread_cond_t stopped;
@@ -194,7 +196,7 @@ task_cleanup(void *arg)
 	--queue->nspawned;
 
 	if (!queue->deiniting) {
-		ret = pthread_create(&t, &queue->worker_attr, task_work, queue);
+		ret = pthread_create(&t, &queue->workerattr, task_work, queue);
 		assert(ret == 0);
 
 	} else if (queue->nspawned == 0) {
@@ -224,8 +226,8 @@ task_init_queue(TaskQueue *queue, Int nworkers)
 
 	(void)sigfillset(&queue->sigfillset);
 
-	(void)pthread_attr_init(&queue->worker_attr);
-	(void)pthread_attr_setdetachstate(&queue->worker_attr, PTHREAD_CREATE_DETACHED);
+	(void)pthread_attr_init(&queue->workerattr);
+	(void)pthread_attr_setdetachstate(&queue->workerattr, PTHREAD_CREATE_DETACHED);
 
 	(void)pthread_mutex_init(&queue->mutex, NULL);
 	(void)pthread_cond_init(&queue->newtask, NULL);
@@ -240,7 +242,7 @@ task_init_queue(TaskQueue *queue, Int nworkers)
 
 	for (Int i = 0; i < nworkers; ++i) {
 		pthread_t thread;
-		int ret = pthread_create(&thread, &queue->worker_attr, task_work, queue);
+		int ret = pthread_create(&thread, &queue->workerattr, task_work, queue);
 		assert(ret == 0);
 	}
 }
@@ -281,7 +283,6 @@ static void
 task_deinit_queue(TaskQueue *queue)
 {
 	(void)pthread_mutex_lock(&queue->mutex);
-	pthread_cleanup_push(task_unlock_mutex, &queue->mutex);
 
 	queue->deiniting = 1;
 	(void)pthread_cond_broadcast(&queue->newtask);
@@ -290,18 +291,18 @@ task_deinit_queue(TaskQueue *queue)
 	TAILQ_FOREACH (active, &queue->active, link) {
 		(void)pthread_cancel(active->thread);
 	}
+
+	pthread_cleanup_push(task_unlock_mutex, &queue->mutex);
 	while (!TAILQ_EMPTY(&queue->active)) {
 		queue->waiting = 1;
 		(void)pthread_cond_wait(&queue->alldone, &queue->mutex);
 	}
-
 	while (queue->nspawned > 0) {
 		(void)pthread_cond_wait(&queue->stopped, &queue->mutex);
 	}
-
 	pthread_cleanup_pop(1);
 
-	pthread_attr_destroy(&queue->worker_attr);
+	pthread_attr_destroy(&queue->workerattr);
 	pthread_cond_destroy(&queue->newtask);
 	pthread_cond_destroy(&queue->alldone);
 	pthread_cond_destroy(&queue->stopped);
@@ -420,7 +421,7 @@ event_flush_pending(EventCompletionQueue *pending, int size, struct kevent buf[s
 			break;
 
 		default:
-			assert(0);
+			unreachable();
 		}
 	}
 
@@ -658,15 +659,6 @@ event_deinit_loop(EventLoop *loop)
 
 /***********************************************************************/
 
-#include <netdb.h>
-
-#include <locale.h>
-#include <stdio.h>
-
-static EventLoop eventloop;
-static TaskQueue ioqueue;
-static TaskQueue computequeue;
-
 typedef struct {
 	EventLoop *loop;
 	int sock;
@@ -773,13 +765,21 @@ echo_on_close(void *arg, Ptr ret)
 	echo_free_context(ctx);
 }
 
+#include <netdb.h>
+
+#include <locale.h>
+#include <stdio.h>
+
+static EventLoop eventloop;
+static TaskQueue taskqueue;
+
 static void
 loop(void *arg)
 {
 	(void)arg;
 
 	event_loop_for_ns(&eventloop, 100L * 1000L * 1000L); // 100 ms
-	task_execute(&ioqueue, loop, NULL);
+	task_execute(&taskqueue, loop, NULL);
 }
 
 int
@@ -794,9 +794,8 @@ main(void)
 	setlocale(LC_ALL, "C");
 	signal(SIGPIPE, SIG_IGN);
 
-	task_init_queue(&computequeue, 1);
-	task_init_queue(&ioqueue, 1);
 	event_init_loop(&eventloop);
+	task_init_queue(&taskqueue, 1);
 
 	struct addrinfo hints = {
 		.ai_family = AF_UNSPEC,
@@ -831,10 +830,10 @@ main(void)
 
 	freeaddrinfo(addrinfo);
 
-	task_execute(&ioqueue, loop, NULL);
+	task_execute(&taskqueue, loop, NULL);
 
-	task_wait_all(&ioqueue);
+	task_wait_all(&taskqueue);
 
+	task_deinit_queue(&taskqueue);
 	event_deinit_loop(&eventloop);
-	task_deinit_queue(&ioqueue);
 }
