@@ -31,9 +31,9 @@ static void event_deinit_loop(EventLoop *loop);
 static void event_accept(EventLoop *loop, int sock, EventCallback *cb, void *arg);
 static void event_close(EventLoop *loop, int fd, EventCallback *cb, void *arg);
 static void
-event_recv(EventLoop *loop, int sock, void *buf, size_t size, EventCallback *cb, void *arg);
-static void
-event_send(EventLoop *loop, int sock, const void *buf, size_t size, EventCallback *cb, void *arg);
+event_recv(EventLoop *loop, int sock, void *buf, size_t bufsize, EventCallback *cb, void *arg);
+static void event_send(
+	EventLoop *loop, int sock, const void *buf, size_t bufsize, EventCallback *cb, void *arg);
 static void event_timer(EventLoop *loop, int64_t ns, EventCallback *cb, void *arg);
 static void event_tick(EventLoop *loop);
 static void event_loop_for_ns(EventLoop *loop, int64_t ns);
@@ -320,13 +320,13 @@ typedef struct {
 		struct {
 			int sock;
 			void *buf;
-			size_t size;
+			size_t bufsize;
 		} recv;
 
 		struct {
 			int sock;
 			const void *buf;
-			size_t size;
+			size_t bufsize;
 		} send;
 
 		struct {
@@ -370,11 +370,11 @@ event_free_completion(EventCompletion *completion)
 }
 
 static int
-event_flush_pending(EventCompletionQueue *pending, int size, struct kevent buf[static size])
+event_flush_pending(EventCompletionQueue *pending, int bufsize, struct kevent buf[static bufsize])
 {
 	int i;
-	for (i = 0; i < size && !STAILQ_EMPTY(pending); ++i) {
-		EventCompletion *completion = STAILQ_FIRST(pending);
+	EventCompletion *completion;
+	for (i = 0; i < bufsize && (completion = STAILQ_FIRST(pending)); ++i) {
 		STAILQ_REMOVE_HEAD(pending, link);
 
 		struct kevent *event = &buf[i];
@@ -570,15 +570,15 @@ event_onready_close(const EventOp *op)
 }
 
 static void
-event_recv(EventLoop *loop, int sock, void *buf, size_t size, EventCallback *cb, void *arg)
+event_recv(EventLoop *loop, int sock, void *buf, size_t bufsize, EventCallback *cb, void *arg)
 {
-	assert(size >= 0);
+	assert(bufsize >= 0);
 
 	event_submit(
 		&loop->completed,
 		&(EventCompletion){
 			.op.code = EVENT_OP_RECV,
-			.op.args.recv = {sock, buf, size},
+			.op.args.recv = {sock, buf, bufsize},
 			.onready = event_onready_recv,
 			.cb = cb,
 			.arg = arg,
@@ -590,22 +590,22 @@ event_onready_recv(const EventOp *op)
 {
 	int sock = op->args.recv.sock;
 	void *buf = op->args.recv.buf;
-	size_t size = op->args.recv.size;
+	size_t bufsize = op->args.recv.bufsize;
 
-	ssize_t n = recv(sock, buf, size, 0);
+	ssize_t n = recv(sock, buf, bufsize, 0);
 	return n < 0 ? -errno : n;
 }
 
 static void
-event_send(EventLoop *loop, int sock, const void *buf, size_t size, EventCallback *cb, void *arg)
+event_send(EventLoop *loop, int sock, const void *buf, size_t bufsize, EventCallback *cb, void *arg)
 {
-	assert(size >= 0);
+	assert(bufsize >= 0);
 
 	event_submit(
 		&loop->completed,
 		&(EventCompletion){
 			.op.code = EVENT_OP_SEND,
-			.op.args.send = {sock, buf, size},
+			.op.args.send = {sock, buf, bufsize},
 			.onready = event_onready_send,
 			.cb = cb,
 			.arg = arg,
@@ -617,9 +617,9 @@ event_onready_send(const EventOp *op)
 {
 	int sock = op->args.send.sock;
 	const void *buf = op->args.send.buf;
-	size_t size = op->args.send.size;
+	size_t bufsize = op->args.send.bufsize;
 
-	ssize_t n = send(sock, buf, size, 0);
+	ssize_t n = send(sock, buf, bufsize, 0);
 	return n < 0 ? -errno : n;
 }
 
@@ -740,7 +740,9 @@ echo_on_send(void *arg, intptr_t ret)
 	if (ctx->sendsize > 0) {
 		event_send(ctx->loop, ctx->sock, ctx->sendstart, ctx->sendsize, echo_on_send, ctx);
 	} else {
-		event_recv(ctx->loop, ctx->sock, ctx->sendbuf, countof(ctx->sendbuf), echo_on_recv, ctx);
+		event_recv(
+			ctx->loop, ctx->sock, ctx->sendbuf, countof(ctx->sendbuf), echo_on_recv,
+			ctx);
 	}
 }
 
