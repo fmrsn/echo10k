@@ -1,24 +1,10 @@
 #define _POSIX_C_SOURCE 200908L // TODO(fmrsn): Move to command line
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
-typedef int32_t Int;
-typedef int64_t Long;
-
-typedef uint32_t UInt;
-typedef uint64_t ULong;
-
-typedef ptrdiff_t Size;
-typedef size_t USize;
-
-typedef intptr_t Ptr;
-typedef uintptr_t UPtr;
-
-typedef Int Bool;
-
-#define size_of(x) (Size)sizeof(x)
-#define count_of(x) (size_of(x) / size_of((x)[0]))
+#define countof(x) (sizeof(x) / sizeof((x)[0]))
 
 // TODO(fmrsn): Remove stdlib dependency
 #include <assert.h> // assert(x)
@@ -29,7 +15,7 @@ typedef struct TaskQueue TaskQueue;
 typedef void TaskFunc(void *arg);
 
 // TODO(fmrsn): use memory arena + pool allocator for context objects
-static void task_init_queue(TaskQueue *queue, Int numWorkers);
+static void task_init_queue(TaskQueue *queue, int nworkers);
 static void task_deinit_queue(TaskQueue *queue);
 static void task_execute(TaskQueue *queue, TaskFunc *func, void *arg);
 static void task_wait_all(TaskQueue *queue);
@@ -37,7 +23,7 @@ static void task_wait_all(TaskQueue *queue);
 // TODO(fmrsn): static void task_cancel(what?);
 
 typedef struct EventLoop EventLoop;
-typedef void EventCallback(void *arg, Ptr ret);
+typedef void EventCallback(void *arg, intptr_t ret);
 
 // TODO(fmrsn): use memory arena + pool allocator for context objects
 static void event_init_loop(EventLoop *loop);
@@ -45,14 +31,16 @@ static void event_deinit_loop(EventLoop *loop);
 static void event_accept(EventLoop *loop, int sock, EventCallback *cb, void *arg);
 static void event_close(EventLoop *loop, int fd, EventCallback *cb, void *arg);
 static void
-event_recv(EventLoop *loop, int sock, void *buf, Size size, EventCallback *cb, void *arg);
+event_recv(EventLoop *loop, int sock, void *buf, size_t size, EventCallback *cb, void *arg);
 static void
-event_send(EventLoop *loop, int sock, const void *buf, Size size, EventCallback *cb, void *arg);
-static void event_timer(EventLoop *loop, Long ns, EventCallback *cb, void *arg);
+event_send(EventLoop *loop, int sock, const void *buf, size_t size, EventCallback *cb, void *arg);
+static void event_timer(EventLoop *loop, int64_t ns, EventCallback *cb, void *arg);
 static void event_tick(EventLoop *loop);
-static void event_loop_for_ns(EventLoop *loop, Long ns);
+static void event_loop_for_ns(EventLoop *loop, int64_t ns);
 
 // TODO(fmrsn): operation: cancel event submission
+
+typedef struct EventLoopGroup EventLoopGroup;
 
 /* *************************************** */
 
@@ -89,10 +77,10 @@ struct TaskQueue {
 	pthread_mutex_t mutex;
 	TaskSubmissionQueue pending;
 	TaskSubmissionQueue active;
-	Int nspawned;
-	Int nidle;
-	Bool waiting;
-	Bool deiniting;
+	int nspawned;
+	int nidle;
+	bool waiting;
+	bool deiniting;
 };
 
 // TODO(fmrsn): (De)allocations using malloc/free here are pretty frequent.
@@ -100,7 +88,7 @@ struct TaskQueue {
 static TaskSubmission *
 task_alloc_submission(void)
 {
-	TaskSubmission *s = malloc(size_of(*s));
+	TaskSubmission *s = malloc(sizeof *s);
 	assert(s);
 	return s;
 }
@@ -220,7 +208,7 @@ task_unlock_mutex(void *mutex)
  */
 
 static void
-task_init_queue(TaskQueue *queue, Int nworkers)
+task_init_queue(TaskQueue *queue, int nworkers)
 {
 	assert(nworkers > 0);
 
@@ -240,7 +228,7 @@ task_init_queue(TaskQueue *queue, Int nworkers)
 	queue->nidle = 0;
 	queue->nspawned = 0;
 
-	for (Int i = 0; i < nworkers; ++i) {
+	for (int i = 0; i < nworkers; ++i) {
 		pthread_t thread;
 		int ret = pthread_create(&thread, &queue->workerattr, task_work, queue);
 		assert(ret == 0);
@@ -332,17 +320,17 @@ typedef struct {
 		struct {
 			int sock;
 			void *buf;
-			Size size;
+			size_t size;
 		} recv;
 
 		struct {
 			int sock;
 			const void *buf;
-			Size size;
+			size_t size;
 		} send;
 
 		struct {
-			Long ns;
+			int64_t ns;
 		} timer;
 	} args;
 } EventOp;
@@ -351,10 +339,10 @@ typedef struct EventCompletion {
 	STAILQ_ENTRY(EventCompletion) link;
 
 	EventOp op;
-	Ptr (*onready)(const EventOp *op);
-	void (*cb)(void *arg, Ptr ret);
+	intptr_t (*onready)(const EventOp *op);
+	void (*cb)(void *arg, intptr_t ret);
 	void *arg;
-	Ptr ret;
+	intptr_t ret;
 
 } EventCompletion;
 
@@ -370,7 +358,7 @@ struct EventLoop {
 static EventCompletion *
 event_alloc_completion(void)
 {
-	EventCompletion *completion = malloc(size_of(*completion));
+	EventCompletion *completion = malloc(sizeof *completion);
 	assert(completion);
 	return completion;
 }
@@ -414,7 +402,7 @@ event_flush_pending(EventCompletionQueue *pending, int size, struct kevent buf[s
 			break;
 
 		case EVENT_OP_TIMER:
-			event->ident = (UPtr)completion;
+			event->ident = (uintptr_t)completion;
 			event->filter = EVFILT_TIMER;
 			event->fflags = NOTE_NSECONDS;
 			event->data = op->args.timer.ns;
@@ -432,10 +420,10 @@ static void
 event_flush(EventLoop *loop, const struct timespec *timeout)
 {
 	struct kevent events[256];
-	int nchanges = event_flush_pending(&loop->pending, count_of(events), events);
+	int nchanges = event_flush_pending(&loop->pending, countof(events), events);
 
 	if (nchanges > 0 || (STAILQ_EMPTY(&loop->completed) && loop->inflight > 0)) {
-		int nevents = kevent(loop->kq, events, nchanges, events, count_of(events), timeout);
+		int nevents = kevent(loop->kq, events, nchanges, events, countof(events), timeout);
 		assert(nevents >= 0);
 
 		loop->inflight += nchanges - nevents;
@@ -457,7 +445,7 @@ event_flush(EventLoop *loop, const struct timespec *timeout)
 			completed->ret = completed->onready(&completed->op);
 		}
 
-		Bool retry = completed->ret == -EAGAIN || completed->ret == -EWOULDBLOCK;
+		bool retry = completed->ret == -EAGAIN || completed->ret == -EWOULDBLOCK;
 		if (retry) {
 			STAILQ_INSERT_TAIL(&loop->pending, completed, link);
 		} else if (completed->cb) {
@@ -491,18 +479,18 @@ event_tick(EventLoop *loop)
 }
 
 static void
-event_loop_done(void *arg, Ptr ret)
+event_loop_done(void *arg, intptr_t ret)
 {
 	(void)ret;
 
-	Bool *done = arg;
+	bool *done = arg;
 	*done = 1;
 }
 
 static void
-event_loop_for_ns(EventLoop *loop, Long ns)
+event_loop_for_ns(EventLoop *loop, int64_t ns)
 {
-	Bool done = 0;
+	bool done = 0;
 
 	event_timer(loop, ns, event_loop_done, &done);
 	while (!done) {
@@ -519,10 +507,10 @@ event_submit(EventCompletionQueue *queue, EventCompletion *desc)
 	STAILQ_INSERT_TAIL(queue, completion, link);
 }
 
-static Ptr event_onready_accept(const EventOp *);
-static Ptr event_onready_close(const EventOp *);
-static Ptr event_onready_recv(const EventOp *);
-static Ptr event_onready_send(const EventOp *);
+static intptr_t event_onready_accept(const EventOp *);
+static intptr_t event_onready_close(const EventOp *);
+static intptr_t event_onready_recv(const EventOp *);
+static intptr_t event_onready_send(const EventOp *);
 
 static void
 event_accept(EventLoop *loop, int sock, EventCallback *cb, void *arg)
@@ -538,7 +526,7 @@ event_accept(EventLoop *loop, int sock, EventCallback *cb, void *arg)
 		});
 }
 
-static Ptr
+static intptr_t
 event_onready_accept(const EventOp *op)
 {
 	int listensock = op->args.accept.sock;
@@ -572,7 +560,7 @@ event_close(EventLoop *loop, int fd, EventCallback *cb, void *arg)
 		});
 }
 
-static Ptr
+static intptr_t
 event_onready_close(const EventOp *op)
 {
 	int fd = op->args.close.fd;
@@ -582,7 +570,7 @@ event_onready_close(const EventOp *op)
 }
 
 static void
-event_recv(EventLoop *loop, int sock, void *buf, Size size, EventCallback *cb, void *arg)
+event_recv(EventLoop *loop, int sock, void *buf, size_t size, EventCallback *cb, void *arg)
 {
 	assert(size >= 0);
 
@@ -597,19 +585,19 @@ event_recv(EventLoop *loop, int sock, void *buf, Size size, EventCallback *cb, v
 		});
 }
 
-static Ptr
+static intptr_t
 event_onready_recv(const EventOp *op)
 {
 	int sock = op->args.recv.sock;
 	void *buf = op->args.recv.buf;
-	Size size = op->args.recv.size;
+	size_t size = op->args.recv.size;
 
 	ssize_t n = recv(sock, buf, size, 0);
 	return n < 0 ? -errno : n;
 }
 
 static void
-event_send(EventLoop *loop, int sock, const void *buf, Size size, EventCallback *cb, void *arg)
+event_send(EventLoop *loop, int sock, const void *buf, size_t size, EventCallback *cb, void *arg)
 {
 	assert(size >= 0);
 
@@ -624,19 +612,19 @@ event_send(EventLoop *loop, int sock, const void *buf, Size size, EventCallback 
 		});
 }
 
-static Ptr
+static intptr_t
 event_onready_send(const EventOp *op)
 {
 	int sock = op->args.send.sock;
 	const void *buf = op->args.send.buf;
-	Size size = op->args.send.size;
+	size_t size = op->args.send.size;
 
 	ssize_t n = send(sock, buf, size, 0);
 	return n < 0 ? -errno : n;
 }
 
 static void
-event_timer(EventLoop *loop, Long ns, EventCallback *cb, void *arg)
+event_timer(EventLoop *loop, int64_t ns, EventCallback *cb, void *arg)
 {
 	assert(ns >= 0);
 
@@ -664,14 +652,14 @@ typedef struct {
 	int sock;
 
 	char *sendstart;
-	Size sendsize;
-	char buf[8192];
+	size_t sendsize;
+	char sendbuf[8192];
 } EchoContext;
 
 static EchoContext *
 echo_alloc_context(void)
 {
-	EchoContext *ctx = malloc(size_of(*ctx));
+	EchoContext *ctx = malloc(sizeof *ctx);
 	assert(ctx);
 	return ctx;
 }
@@ -682,13 +670,13 @@ echo_free_context(EchoContext *ctx)
 	free(ctx);
 }
 
-static void echo_on_accept(void *arg, Ptr ret);
-static void echo_on_recv(void *arg, Ptr ret);
-static void echo_on_send(void *arg, Ptr ret);
-static void echo_on_close(void *arg, Ptr ret);
+static void echo_on_accept(void *arg, intptr_t ret);
+static void echo_on_recv(void *arg, intptr_t ret);
+static void echo_on_send(void *arg, intptr_t ret);
+static void echo_on_close(void *arg, intptr_t ret);
 
 static void
-echo_on_accept(void *arg, Ptr ret)
+echo_on_accept(void *arg, intptr_t ret)
 {
 	int r;
 
@@ -703,7 +691,7 @@ echo_on_accept(void *arg, Ptr ret)
 	int flags = fcntl(sock, F_GETFL);
 	(void)fcntl(sock, F_SETFL, flags | O_NONBLOCK);
 
-	r = setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &(int){1}, size_of(int));
+	r = setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &(int){1}, sizeof(int));
 	assert(r >= 0);
 
 	EchoContext *ctx = echo_alloc_context();
@@ -712,13 +700,13 @@ echo_on_accept(void *arg, Ptr ret)
 		.sock = sock,
 	};
 
-	event_recv(ctx->loop, sock, ctx->buf, count_of(ctx->buf), echo_on_recv, ctx);
+	event_recv(ctx->loop, sock, ctx->sendbuf, countof(ctx->sendbuf), echo_on_recv, ctx);
 
 	event_accept(listenctx->loop, listenctx->sock, echo_on_accept, listenctx);
 }
 
 static void
-echo_on_recv(void *arg, Ptr ret)
+echo_on_recv(void *arg, intptr_t ret)
 {
 	EchoContext *ctx = arg;
 
@@ -728,14 +716,14 @@ echo_on_recv(void *arg, Ptr ret)
 		return;
 	}
 
-	ctx->sendstart = ctx->buf;
+	ctx->sendstart = ctx->sendbuf;
 	ctx->sendsize = ret;
 
-	event_send(ctx->loop, ctx->sock, ctx->buf, ctx->sendsize, echo_on_send, ctx);
+	event_send(ctx->loop, ctx->sock, ctx->sendbuf, ctx->sendsize, echo_on_send, ctx);
 }
 
 static void
-echo_on_send(void *arg, Ptr ret)
+echo_on_send(void *arg, intptr_t ret)
 {
 	EchoContext *ctx = arg;
 
@@ -745,19 +733,19 @@ echo_on_send(void *arg, Ptr ret)
 		return;
 	}
 
-	Size nsent = ret;
+	size_t nsent = ret;
 	ctx->sendstart += nsent;
 	ctx->sendsize -= nsent;
 
 	if (ctx->sendsize > 0) {
 		event_send(ctx->loop, ctx->sock, ctx->sendstart, ctx->sendsize, echo_on_send, ctx);
 	} else {
-		event_recv(ctx->loop, ctx->sock, ctx->buf, count_of(ctx->buf), echo_on_recv, ctx);
+		event_recv(ctx->loop, ctx->sock, ctx->sendbuf, countof(ctx->sendbuf), echo_on_recv, ctx);
 	}
 }
 
 static void
-echo_on_close(void *arg, Ptr ret)
+echo_on_close(void *arg, intptr_t ret)
 {
 	(void)ret;
 
@@ -813,7 +801,7 @@ main(void)
 		int flags = fcntl(sock, F_GETFL);
 		fcntl(sock, F_SETFL, flags | O_NONBLOCK);
 
-		r = setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &(int){1}, size_of(int));
+		r = setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &(int){1}, sizeof(int));
 		assert(r != -1);
 
 		r = bind(sock, ai->ai_addr, ai->ai_addrlen);
